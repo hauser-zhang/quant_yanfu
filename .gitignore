@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.venv/
+
+# Node
+node_modules/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
