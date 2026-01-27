@@ -1,0 +1,31 @@
+# 安装说明：
+# 1. 临时取消代理环境变量：unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+# 2. 安装PyTorch等：pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# 3. 安装其他包：pip install lightgbm catboost shap ipykernel
+# 4. 安装xgboost：conda install -c conda-forge xgboost -y
+# 5. 降级numpy：pip install --force-reinstall "numpy==2.3.5"
+# 6. 注册kernel：python -m ipykernel install --user --name quant26 --display-name "Python (quant26)"
+
+# ===== 基础数据科学包 =====
+numpy==2.3.5
+pandas
+matplotlib
+scikit-learn
+
+# ===== 深度学习框架（CUDA 11.8）=====
+# 注意：需要从PyTorch官网安装，使用以下命令：
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# ===== 机器学习框架 =====
+lightgbm
+catboost
+# xgboost需要conda安装：conda install -c conda-forge xgboost -y
+
+# ===== Jupyter支持 =====
+ipykernel
+nbformat
+nbclient
+
+# ===== 模型解释 =====
+shap
+tqdm

@@ -8,10 +8,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 
-# Node
-node_modules/
-
 # Build outputs
 build/
 dist/
 *.egg-info/
+
+# others
+/data/*
