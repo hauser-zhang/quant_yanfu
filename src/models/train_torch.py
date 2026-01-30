@@ -419,6 +419,7 @@ def train_torch_model(
                 f"val_loss={vloss:.4f}, val_ic={valid_corr:.4f}"
             )
             print(msg)
+            print("")
 
         history.append(
             {
@@ -429,6 +430,15 @@ def train_torch_model(
                 "valid_corr": float(valid_corr),
             }
         )
+        if log_path and do_log:
+            path = Path(log_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", newline="") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["epoch", "train_loss", "train_corr", "valid_loss", "valid_corr"]
+                )
+                writer.writeheader()
+                writer.writerows(history)
         if vloss < best_loss - early_stop_min_delta:
             best_loss = vloss
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
