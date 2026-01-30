@@ -16,8 +16,6 @@ dist/
 # others
 /data/*
 /res/experiments/
-/scripts/
-/src/notebooks/scripts/
 *.log
 .ipynb_checkpoints/
 ./CLASSIFICATION.md

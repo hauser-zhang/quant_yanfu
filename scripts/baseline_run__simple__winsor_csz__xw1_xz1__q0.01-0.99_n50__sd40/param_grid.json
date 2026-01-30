@@ -1,0 +1,69 @@
+{
+  "torch_cnn": {
+    "cnn_channels": [
+      [
+        32,
+        64
+      ]
+    ],
+    "kernel_size": [
+      3
+    ],
+    "dropout": [
+      0.1
+    ],
+    "alpha_layers": [
+      2
+    ],
+    "alpha_hidden_dim": [
+      64
+    ],
+    "f_layers": [
+      1
+    ],
+    "f_hidden_dim": [
+      32
+    ],
+    "batch_size": [
+      2048
+    ],
+    "num_workers": [
+      2
+    ],
+    "max_epochs": [
+      50
+    ]
+  },
+  "torch_rnn": {
+    "rnn_hidden": [
+      64
+    ],
+    "rnn_layers": [
+      1
+    ],
+    "dropout": [
+      0.1
+    ],
+    "alpha_layers": [
+      2
+    ],
+    "alpha_hidden_dim": [
+      64
+    ],
+    "f_layers": [
+      1
+    ],
+    "f_hidden_dim": [
+      32
+    ],
+    "batch_size": [
+      2048
+    ],
+    "num_workers": [
+      2
+    ],
+    "max_epochs": [
+      50
+    ]
+  }
+}
