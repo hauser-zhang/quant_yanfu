@@ -73,6 +73,10 @@
 ## 5. 深度学习方法（MLP基线 -> 1D-CNN/TCN -> RNN -> Transformer；同样做消融与指标对齐；说明为何先CNN后Transformer）
 - 统一使用唯一指标 SCORE
 - 先 CNN/TCN 捕捉局部结构，再考虑 Transformer 的全局依赖
+- **推荐默认超参数（稳定基线）**：
+  - `lr=3e-4`, `batch=2048`, `weight_decay=1e-4`, `dropout=0.2`, `grad_clip=1.0`
+  - `epochs=30`, `early_stop_patience=6`, `ic_every=1`, `scheduler=plateau_ic`
+  - `cnn_channels=[16,32]`, `kernel=3`, `rnn_hidden=32`
 
 ---
 

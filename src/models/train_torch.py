@@ -5,8 +5,9 @@ import csv
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
-from src.eval.metrics import weighted_corr
+from src.eval.metrics import weighted_corr, daily_weighted_mean_ic
 
 
 def _try_import_torch():
@@ -255,6 +256,10 @@ def train_torch_model(
     grid_idx = kwargs.get("grid_idx", None)
     grid_total = kwargs.get("grid_total", None)
     param_tag = kwargs.get("param_tag", None)
+    scheduler_type = str(kwargs.get("scheduler_type", "plateau_ic"))
+    valid_dates = kwargs.get("valid_dates", None)
+    if valid_dates is not None:
+        valid_dates = np.asarray(valid_dates)
 
     Xtr = _prepare_X(X_train)
     Xva = _prepare_X(X_valid)
@@ -315,6 +320,13 @@ def train_torch_model(
     if debug:
         print(model)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = None
+    if scheduler_type == "plateau_ic":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="max", factor=0.5, patience=2, min_lr=1e-6
+        )
+    elif scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_epochs, eta_min=lr * 0.05)
     best_loss = float("inf")
     best_state = None
     best_epoch = -1
@@ -388,10 +400,20 @@ def train_torch_model(
                 wv_all.append(wv.view(-1).cpu().numpy())
             vloss = vloss_sum / max(1, vcount)
 
+        preds_v = np.concatenate(preds_v) if preds_v else np.array([])
+        yv_all = np.concatenate(yv_all) if yv_all else np.array([])
+        wv_all = np.concatenate(wv_all) if wv_all else np.array([])
+        if valid_dates is not None and len(valid_dates) == len(yv_all):
+            df_ic = pd.DataFrame({"date": valid_dates, "pred": preds_v, "y_score": yv_all, "weight": wv_all})
+            valid_ic = daily_weighted_mean_ic(df_ic, "pred", "y_score", "weight", "date")
+            valid_corr = valid_ic
+        else:
+            valid_corr = weighted_corr(yv_all, preds_v, wv_all)
+            valid_ic = valid_corr
+
         # compute weighted corr only when logging (can be expensive)
         do_log = log_every > 0 and (epoch + 1) % log_every == 0
         train_corr = float("nan")
-        valid_corr = float("nan")
         if do_log:
             def _predict_all(loader):
                 preds = []
@@ -407,19 +429,22 @@ def train_torch_model(
                 return np.concatenate(preds), np.concatenate(ys), np.concatenate(ws)
 
             preds_tr, ytr_all, wtr_all = _predict_all(train_loader)
-            preds_v = np.concatenate(preds_v) if preds_v else np.array([])
-            yv_all = np.concatenate(yv_all) if yv_all else np.array([])
-            wv_all = np.concatenate(wv_all) if wv_all else np.array([])
             train_corr = weighted_corr(ytr_all, preds_tr, wtr_all)
-            valid_corr = weighted_corr(yv_all, preds_v, wv_all)
 
             msg = (
                 f"[Epoch {epoch + 1}/{max_epochs}] "
                 f"train_loss={train_loss:.4f}, train_ic={train_corr:.4f}, "
-                f"val_loss={vloss:.4f}, val_ic={valid_corr:.4f}"
+                f"val_loss={vloss:.4f}, val_ic={valid_corr:.4f}, lr={opt.param_groups[0]['lr']:.2e}"
             )
             print(msg)
             print("")
+
+        if scheduler is not None:
+            if scheduler_type == "plateau_ic":
+                if np.isfinite(valid_ic):
+                    scheduler.step(valid_ic)
+            else:
+                scheduler.step()
 
         history.append(
             {
@@ -428,6 +453,8 @@ def train_torch_model(
                 "train_corr": float(train_corr),
                 "valid_loss": float(vloss),
                 "valid_corr": float(valid_corr),
+                "valid_ic": float(valid_ic),
+                "lr": float(opt.param_groups[0]["lr"]),
             }
         )
         if log_path and do_log:
@@ -435,7 +462,16 @@ def train_torch_model(
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("w", newline="") as f:
                 writer = csv.DictWriter(
-                    f, fieldnames=["epoch", "train_loss", "train_corr", "valid_loss", "valid_corr"]
+                    f,
+                    fieldnames=[
+                        "epoch",
+                        "train_loss",
+                        "train_corr",
+                        "valid_loss",
+                        "valid_corr",
+                        "valid_ic",
+                        "lr",
+                    ],
                 )
                 writer.writeheader()
                 writer.writerows(history)
@@ -462,7 +498,10 @@ def train_torch_model(
         path = Path(log_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "train_corr", "valid_loss", "valid_corr"])
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["epoch", "train_loss", "train_corr", "valid_loss", "valid_corr", "valid_ic", "lr"],
+            )
             writer.writeheader()
             writer.writerows(history)
 

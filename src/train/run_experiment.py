@@ -231,6 +231,183 @@ def _param_tag(params: dict, max_len: int = 80) -> str:
     return tag
 
 
+def _apply_dv_log1p(df: pd.DataFrame, pattern: str = r"^dv_\d+$") -> pd.DataFrame:
+    """Apply log1p to dv_* columns (clip to non-negative)."""
+    cols = [c for c in df.columns if re.match(pattern, c)]
+    if not cols:
+        return df
+    out = df.copy()
+    for col in cols:
+        out[col] = np.log1p(np.clip(out[col].astype(float), 0, None))
+    return out
+
+
+def _add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add cyclical time features from DateTime/date."""
+    out = df.copy()
+    if "DateTime" in out.columns:
+        dt = pd.to_datetime(out["DateTime"], errors="coerce")
+    else:
+        dt = pd.to_datetime(out["date"], errors="coerce")
+    dow = dt.dt.dayofweek.fillna(0).astype(int)
+    mon = dt.dt.month.fillna(1).astype(int)
+    out["dow_idx"] = dow
+    out["mon_idx"] = mon
+    out["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
+    out["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
+    out["mon_sin"] = np.sin(2 * np.pi * (mon - 1) / 12.0)
+    out["mon_cos"] = np.cos(2 * np.pi * (mon - 1) / 12.0)
+    return out
+
+
+def _weighted_mean_std(x: pd.Series, w: pd.Series) -> Tuple[float, float]:
+    """Weighted mean/std with NaN and non-positive weight filtering."""
+    mask = (~x.isna()) & (~w.isna()) & (w > 0)
+    if mask.sum() == 0:
+        return float("nan"), float("nan")
+    xx = x[mask].astype(float).to_numpy()
+    ww = w[mask].astype(float).to_numpy()
+    wsum = ww.sum()
+    if wsum <= 0:
+        return float("nan"), float("nan")
+    mu = (ww * xx).sum() / wsum
+    var = (ww * (xx - mu) ** 2).sum() / wsum
+    return float(mu), float(np.sqrt(var))
+
+
+def _add_market_state_features(df: pd.DataFrame, use_r_cols: List[str], dv_col: str) -> pd.DataFrame:
+    """Add market state features by date using weights."""
+    out = df.copy()
+    if "weight" not in out.columns or "date" not in out.columns:
+        return out
+    if not use_r_cols:
+        return out
+    r_src = out[use_r_cols].sum(axis=1) if len(use_r_cols) > 1 else out[use_r_cols[0]]
+    dv_src = out[dv_col] if dv_col in out.columns else None
+    rows = []
+    for date, g in out.groupby("date"):
+        w = g["weight"]
+        mu_r, std_r = _weighted_mean_std(r_src.loc[g.index], w)
+        if dv_src is not None:
+            mu_dv, std_dv = _weighted_mean_std(dv_src.loc[g.index], w)
+        else:
+            mu_dv, std_dv = float("nan"), float("nan")
+        rows.append(
+            {
+                "date": date,
+                "mkt_r_mean": mu_r,
+                "mkt_r_std": std_r,
+                "mkt_dv_mean": mu_dv,
+                "mkt_dv_std": std_dv,
+            }
+        )
+    mkt_df = pd.DataFrame(rows)
+    out = out.merge(mkt_df, on="date", how="left")
+    return out
+
+
+def _add_industry_state_features(df: pd.DataFrame, use_r_cols: List[str], dv_col: str) -> pd.DataFrame:
+    """Add industry state features by date+industry using weights."""
+    out = df.copy()
+    if "industry" not in out.columns or "weight" not in out.columns or "date" not in out.columns:
+        return out
+    if not use_r_cols:
+        return out
+    r_src = out[use_r_cols].sum(axis=1) if len(use_r_cols) > 1 else out[use_r_cols[0]]
+    dv_src = out[dv_col] if dv_col in out.columns else None
+    rows = []
+    for (date, ind), g in out.groupby(["date", "industry"]):
+        w = g["weight"]
+        mu_r, std_r = _weighted_mean_std(r_src.loc[g.index], w)
+        if dv_src is not None:
+            mu_dv, std_dv = _weighted_mean_std(dv_src.loc[g.index], w)
+        else:
+            mu_dv, std_dv = float("nan"), float("nan")
+        rows.append(
+            {
+                "date": date,
+                "industry": ind,
+                "ind_r_mean": mu_r,
+                "ind_r_std": std_r,
+                "ind_dv_mean": mu_dv,
+                "ind_dv_std": std_dv,
+            }
+        )
+    ind_df = pd.DataFrame(rows)
+    out = out.merge(ind_df, on=["date", "industry"], how="left")
+    return out
+
+
+def _dump_debug_snapshots(
+    df_train: pd.DataFrame,
+    df_valid: pd.DataFrame,
+    df_test: pd.DataFrame,
+    run_dir: Path,
+    fold_idx: int,
+    debug_n_rows: int,
+    debug_n_features: int,
+):
+    """Dump debug snapshots and stats after preprocessing."""
+    out_dir = run_dir / "debug" / f"fold{fold_idx}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    base_cols = [
+        "id",
+        "date",
+        "weight",
+        "y_raw",
+        "y_label",
+        "industry",
+        "beta",
+        "indbeta",
+        "r_0",
+        "r_19",
+        "dv_0",
+        "dv_19",
+        "f_0",
+        "f_1",
+    ]
+    extra_prefixes = ("dow_", "mon_", "mkt_", "ind_")
+
+    def _select_cols(df: pd.DataFrame) -> List[str]:
+        cols = [c for c in base_cols if c in df.columns]
+        state_cols = [c for c in df.columns if c.startswith(extra_prefixes)]
+        cols.extend([c for c in state_cols if c not in cols])
+        remaining = [c for c in df.columns if c not in cols]
+        rng = np.random.RandomState(42)
+        if debug_n_features > len(cols) and remaining:
+            k = min(debug_n_features - len(cols), len(remaining))
+            cols.extend(rng.choice(remaining, size=k, replace=False).tolist())
+        return cols
+
+    def _dump_head(df: pd.DataFrame, name: str):
+        cols = _select_cols(df)
+        df.head(debug_n_rows)[cols].to_csv(out_dir / f"{name}_head.csv", index=False)
+
+    _dump_head(df_train, "train")
+    _dump_head(df_valid, "valid")
+    _dump_head(df_test, "test")
+
+    def _stats(df: pd.DataFrame, cols: List[str]):
+        stats = {}
+        for c in cols:
+            if c not in df.columns:
+                continue
+            s = df[c]
+            stats[c] = {
+                "mean": float(s.mean()),
+                "std": float(s.std()),
+                "p1": float(s.quantile(0.01)),
+                "p99": float(s.quantile(0.99)),
+                "missing_rate": float(s.isna().mean()),
+            }
+        return stats
+
+    key_cols = _select_cols(df_train)
+    (out_dir / "x_stats_train.json").write_text(json.dumps(_stats(df_train, key_cols), indent=2))
+    (out_dir / "x_stats_valid.json").write_text(json.dumps(_stats(df_valid, key_cols), indent=2))
+
+
 def _sample_days_by_year(paths: List[Path], max_days_per_year: int, seed: int) -> List[Path]:
     """Sample a fixed number of days per year for quick demos."""
     by_year: Dict[str, List[Path]] = {}
@@ -423,6 +600,10 @@ def main() -> None:
     parser.add_argument("--grid_seed", type=int, default=42, help="Random seed for param sampling.")
     parser.add_argument("--n_jobs", type=int, default=16, help="CPU threads per model (rf/extra/lgbm/xgb/catboost).")
     parser.add_argument("--label_mode", type=str, default="raw", help="Label mode: raw | winsor_csz | neu_winsor_csz.")
+    parser.add_argument("--dv_log1p", action=argparse.BooleanOptionalAction, default=True, help="Apply log1p to dv_*.")
+    parser.add_argument("--add_time_features", action=argparse.BooleanOptionalAction, default=True, help="Add cyclical time features.")
+    parser.add_argument("--add_market_state_features", action=argparse.BooleanOptionalAction, default=True, help="Add market state features.")
+    parser.add_argument("--add_industry_state_features", action=argparse.BooleanOptionalAction, default=True, help="Add industry state features.")
     parser.add_argument("--x_winsorize_by_date", action="store_true", help="Feature winsorization by date (X only).")
     parser.add_argument("--x_zscore_by_date", action="store_true", help="Feature z-score by date (X only).")
     parser.add_argument("--data_workers", type=int, default=4, help="Parallel workers for daily data loading.")
@@ -443,6 +624,9 @@ def main() -> None:
         default=None,
         help="JSON path or JSON string mapping model->param grid.",
     )
+    parser.add_argument("--dump_debug_snapshots", action="store_true", help="Dump debug snapshots after preprocessing.")
+    parser.add_argument("--debug_n_rows", type=int, default=2000, help="Rows to dump in debug snapshots.")
+    parser.add_argument("--debug_n_features", type=int, default=60, help="Number of features to include in debug snapshots.")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging and checks.")
     args = parser.parse_args()
     if args.label_mode not in {"raw", "winsor_csz", "neu_winsor_csz"}:
@@ -478,6 +662,10 @@ def main() -> None:
         "grid_seed": args.grid_seed,
         "n_jobs": args.n_jobs,
         "label_mode": args.label_mode,
+        "dv_log1p": args.dv_log1p,
+        "add_time_features": args.add_time_features,
+        "add_market_state_features": args.add_market_state_features,
+        "add_industry_state_features": args.add_industry_state_features,
         "x_winsorize_by_date": args.x_winsorize_by_date,
         "x_zscore_by_date": args.x_zscore_by_date,
         "data_workers": args.data_workers,
@@ -490,6 +678,9 @@ def main() -> None:
         "use_pred_z": args.use_pred_z,
         "use_neutralize": args.use_neutralize,
         "param_grid": args.param_grid,
+        "dump_debug_snapshots": args.dump_debug_snapshots,
+        "debug_n_rows": args.debug_n_rows,
+        "debug_n_features": args.debug_n_features,
         "debug": args.debug,
     }
     (run_dir / "config.json").write_text(json.dumps(config, indent=2))
@@ -541,6 +732,33 @@ def main() -> None:
         df_valid["y_raw"] = df_valid["y"]
         df_test["y_raw"] = df_test["y"]
 
+        # Optional dv log1p transform (before X preprocessing)
+        if args.dv_log1p:
+            df_train = _apply_dv_log1p(df_train)
+            df_valid = _apply_dv_log1p(df_valid)
+            df_test = _apply_dv_log1p(df_test)
+
+        # Optional time/state features
+        if args.add_time_features:
+            df_train = _add_time_features(df_train)
+            df_valid = _add_time_features(df_valid)
+            df_test = _add_time_features(df_test)
+
+        use_r_cols = [c for c in df_train.columns if c in {"r_0", "r_1", "r_2", "r_3"}]
+        if not use_r_cols and "r_0" in df_train.columns:
+            use_r_cols = ["r_0"]
+        dv_col = "dv_0" if "dv_0" in df_train.columns else ""
+
+        if args.add_market_state_features:
+            df_train = _add_market_state_features(df_train, use_r_cols, dv_col)
+            df_valid = _add_market_state_features(df_valid, use_r_cols, dv_col)
+            df_test = _add_market_state_features(df_test, use_r_cols, dv_col)
+
+        if args.add_industry_state_features:
+            df_train = _add_industry_state_features(df_train, use_r_cols, dv_col)
+            df_valid = _add_industry_state_features(df_valid, use_r_cols, dv_col)
+            df_test = _add_industry_state_features(df_test, use_r_cols, dv_col)
+
         print(f"[Step2] Feature preprocessing (fold {fold_idx})")
         # Feature preprocessing (winsorize / zscore) on numeric columns
         exclude_cols = {"id", "y", "y_raw", "weight", "DateTime", "date", "industry"}
@@ -551,6 +769,8 @@ def main() -> None:
             and pd.api.types.is_numeric_dtype(df_train[c])
             and not pd.api.types.is_bool_dtype(df_train[c])
         ]
+        zscore_exclude_prefixes = ("dow_", "mon_", "mkt_", "ind_")
+        zscore_cols = [c for c in num_cols if not c.startswith(zscore_exclude_prefixes)]
         pp_workers = args.preprocess_workers or args.data_workers
         if args.x_winsorize_by_date:
             df_train = winsorize_by_date(
@@ -585,13 +805,13 @@ def main() -> None:
             )
         if args.x_zscore_by_date:
             df_train = zscore_by_date(
-                df_train, num_cols, args.min_n, show_progress=True, desc="Z-score X train", n_workers=pp_workers
+                df_train, zscore_cols, args.min_n, show_progress=True, desc="Z-score X train", n_workers=pp_workers
             )
             df_valid = zscore_by_date(
-                df_valid, num_cols, args.min_n, show_progress=True, desc="Z-score X valid", n_workers=pp_workers
+                df_valid, zscore_cols, args.min_n, show_progress=True, desc="Z-score X valid", n_workers=pp_workers
             )
             df_test = zscore_by_date(
-                df_test, num_cols, args.min_n, show_progress=True, desc="Z-score X test", n_workers=pp_workers
+                df_test, zscore_cols, args.min_n, show_progress=True, desc="Z-score X test", n_workers=pp_workers
             )
         print(f"[Step2] Feature preprocessing done (fold {fold_idx})")
 
@@ -646,6 +866,17 @@ def main() -> None:
         df_valid["y_score"] = df_valid["y_label"]
         df_test["y_score"] = df_test["y_label"]
 
+        if args.dump_debug_snapshots:
+            _dump_debug_snapshots(
+                df_train,
+                df_valid,
+                df_test,
+                run_dir,
+                fold_idx,
+                args.debug_n_rows,
+                args.debug_n_features,
+            )
+
         if args.debug:
             def _stat(s):
                 return {
@@ -664,6 +895,31 @@ def main() -> None:
         X_valid, y_valid, w_valid = transform_eval(df_valid, state, label_col="y_label")
         X_test, y_test, w_test = transform_eval(df_test, state, label_col="y_label")
         feature_groups = _get_feature_groups(feature_names)
+
+        # Dump torch first batch if requested
+        if args.dump_debug_snapshots and any(m.startswith("torch_") for m in model_list):
+            dbg_dir = run_dir / "debug" / f"fold{fold_idx}"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            n = min(args.debug_n_rows, len(X_train))
+            Xb = X_train.head(n)
+            yb = y_train[:n]
+            wb = w_train[:n]
+            np.savez(
+                dbg_dir / "torch_first_batch.npz",
+                X_batch=Xb.to_numpy(),
+                y_batch=yb,
+                w_batch=wb,
+                feature_names=np.array(list(Xb.columns)),
+            )
+            if "r_0" in Xb.columns and "r_19" in Xb.columns and "dv_0" in Xb.columns and "dv_19" in Xb.columns:
+                r_cols = [f"r_{i}" for i in range(20) if f"r_{i}" in Xb.columns]
+                dv_cols = [f"dv_{i}" for i in range(20) if f"dv_{i}" in Xb.columns]
+                if len(r_cols) == 20 and len(dv_cols) == 20:
+                    np.savez(
+                        dbg_dir / "torch_first_batch_seq.npz",
+                        r_seq=Xb[r_cols].to_numpy(),
+                        dv_seq=Xb[dv_cols].to_numpy(),
+                    )
         print(f"[Step3] Matrices ready (fold {fold_idx})")
 
         if args.debug:
@@ -687,6 +943,7 @@ def main() -> None:
             df_test["y_label"].notna(),
             ["date", "weight", "y_raw", "y_score", "industry", "beta", "indbeta"],
         ].reset_index(drop=True)
+        valid_dates_arr = meta_valid["date"].to_numpy()
 
         # Save small sample of train X/y for scale inspection (with id/date)
         sample_n = 1000
@@ -736,6 +993,7 @@ def main() -> None:
                         run_dir / "tuning" / "torch_loss" / f"{mname}_fold{fold_idx}_{tag}.csv"
                     )
                     train_params["feature_names"] = list(Xtr_use.columns)
+                    train_params["valid_dates"] = valid_dates_arr
                 if mname in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}:
                     train_params["feature_names"] = list(Xtr_use.columns)
                 if mname.startswith("torch_"):
@@ -779,6 +1037,7 @@ def main() -> None:
                         run_dir / "tuning" / "torch_loss" / f"{mname}_fold{fold_idx}_{tag}.csv"
                     )
                     train_params["feature_names"] = list(Xtr_use.columns)
+                    train_params["valid_dates"] = valid_dates_arr
                 if mname in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}:
                     train_params["feature_names"] = list(Xtr_use.columns)
                 if mname.startswith("torch_"):
@@ -971,6 +1230,10 @@ def main() -> None:
         feat_names_best = list(raw_cols)
         best_params = dict(best_params)
         best_params["feature_names"] = feat_names_best
+        best_params["valid_dates"] = best_data["meta_valid"]["date"].to_numpy()
+    elif best in {"torch_linear", "torch_mlp"}:
+        best_params = dict(best_params)
+        best_params["valid_dates"] = best_data["meta_valid"]["date"].to_numpy()
     best_model, best_predict_fn = _train_model(
         best,
         Xtr_best,
