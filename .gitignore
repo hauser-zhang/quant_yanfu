@@ -18,5 +18,6 @@ dist/
 /res/experiments/
 *.log
 .ipynb_checkpoints/
+report.md
 ./CLASSIFICATION.md
 ./report.md
