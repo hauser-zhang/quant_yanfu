@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+from tqdm import tqdm
 
 
 def list_daily_paths(data_root: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Path]:
@@ -76,23 +78,44 @@ def load_range(
     end_date: str,
     use_feat: bool = True,
     columns: Optional[Iterable[str]] = None,
+    n_workers: int = 1,
+    show_progress: bool = False,
+    desc: str = "Load data",
 ) -> pd.DataFrame:
     """Load a date range by concatenating daily files."""
     paths = list_daily_paths(data_root, start_date, end_date)
-    return load_paths(paths, use_feat=use_feat, columns=columns)
+    return load_paths(paths, use_feat=use_feat, columns=columns, n_workers=n_workers, show_progress=show_progress, desc=desc)
 
 
 def load_paths(
     paths: Iterable[Path],
     use_feat: bool = True,
     columns: Optional[Iterable[str]] = None,
+    n_workers: int = 1,
+    show_progress: bool = False,
+    desc: str = "Load data",
 ) -> pd.DataFrame:
     """Load a list of day folders and concatenate them."""
+    paths = list(paths)
     frames = []
-    for day_folder in paths:
-        df = load_daily(day_folder, use_feat=use_feat, columns=columns)
-        if not df.empty:
-            frames.append(df)
+    if n_workers and n_workers > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = {ex.submit(load_daily, p, use_feat, columns): p for p in paths}
+            it = as_completed(futures)
+            if show_progress:
+                it = tqdm(it, total=len(futures), desc=desc, ncols=80)
+            for fut in it:
+                df = fut.result()
+                if not df.empty:
+                    frames.append(df)
+    else:
+        it = paths
+        if show_progress:
+            it = tqdm(paths, total=len(paths), desc=desc, ncols=80)
+        for day_folder in it:
+            df = load_daily(day_folder, use_feat=use_feat, columns=columns)
+            if not df.empty:
+                frames.append(df)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)

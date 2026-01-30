@@ -33,3 +33,21 @@ def daily_weighted_corr(df: pd.DataFrame, pred_col: str, y_col: str, w_col: str,
         corr = weighted_corr(g[y_col].to_numpy(), g[pred_col].to_numpy(), g[w_col].to_numpy())
         out.append({"date": date, "corr": corr})
     return pd.DataFrame(out)
+
+
+def daily_weighted_mean_ic(df: pd.DataFrame, pred_col: str, y_col: str, w_col: str, date_col: str) -> float:
+    """Compute daily-weighted-mean IC: sum(W_t * IC_t) / sum(W_t)."""
+    rows = []
+    for date, g in df.groupby(date_col):
+        w = g[w_col].to_numpy()
+        mask = (~np.isnan(g[y_col].to_numpy())) & (~np.isnan(g[pred_col].to_numpy())) & (~np.isnan(w)) & (w > 0)
+        if mask.sum() == 0:
+            continue
+        w_sum = w[mask].sum()
+        ic_t = weighted_corr(g[y_col].to_numpy(), g[pred_col].to_numpy(), w)
+        rows.append((w_sum, ic_t))
+    if not rows:
+        return float("nan")
+    num = sum(w * ic for w, ic in rows)
+    den = sum(w for w, _ in rows)
+    return float(num / den) if den > 0 else float("nan")

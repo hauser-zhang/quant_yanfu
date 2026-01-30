@@ -213,7 +213,9 @@ def main() -> None:
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
+    print("[Step1] Feature building start")
     df_log = build_features(data_root, args.start_date, args.end_date, args.n_workers, args.overwrite)
+    print("[Step1] Feature building done")
 
     if args.run_name:
         out_dir = Path("res/experiments") / args.run_name

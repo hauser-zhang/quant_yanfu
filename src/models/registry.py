@@ -19,6 +19,10 @@ MODEL_SPECS: Dict[str, dict] = {
     "elasticnet": {"type": "sklearn"},
     "torch_linear": {"type": "torch"},
     "torch_mlp": {"type": "torch"},
+    "torch_cnn": {"type": "torch"},
+    "torch_rnn": {"type": "torch"},
+    "torch_lstm": {"type": "torch"},
+    "torch_gru": {"type": "torch"},
 }
 
 if _try_import("catboost"):
