@@ -23,6 +23,11 @@ from src.data.prep import (
 )
 from src.eval.metrics import daily_weighted_corr, daily_weighted_mean_ic
 from src.eval.postprocess import apply_pred_postprocess
+from src.eda.factor_ic import compute_factor_table, default_factor_cols, plot_factor_ic_hist, plot_factor_ic_top20
+from src.eda.data_profile import run_data_profile
+from src.features.id_encoding import fit_transform_id_te, transform_id_te
+from src.utils.exp_io import make_run_dirs, save_config, save_table
+from src.analysis.ablation import build_ablation_variants, filter_variant_columns, make_ablation_tables
 from src.models.registry import MODEL_SPECS
 from src.models.train_sklearn import train_ridge, train_elasticnet, train_rf, train_extra_trees
 from src.models.train_lgbm import train_lgbm
@@ -453,6 +458,9 @@ def _train_eval_one(
     use_neutralize: bool,
     params: dict | None = None,
     save_ic: bool = True,
+    id_train=None,
+    id_valid=None,
+    id_test=None,
 ):
     """Train one model and evaluate on valid/test splits."""
     model, predict_fn = _train_model(
@@ -467,9 +475,14 @@ def _train_eval_one(
         n_jobs,
         params=params,
     )
-    pred_train = predict_fn(X_train)
-    pred_valid = predict_fn(X_valid)
-    pred_test = predict_fn(X_test)
+    try:
+        pred_train = predict_fn(X_train, id_train)
+        pred_valid = predict_fn(X_valid, id_valid)
+        pred_test = predict_fn(X_test, id_test)
+    except TypeError:
+        pred_train = predict_fn(X_train)
+        pred_valid = predict_fn(X_valid)
+        pred_test = predict_fn(X_test)
 
     df_train_pred = meta_train.copy()
     df_valid_pred = meta_valid.copy()
@@ -543,6 +556,7 @@ def _perm_importance(
     postprocess_pipeline: str,
     use_pred_z: bool,
     use_neutralize: bool,
+    n_repeats: int = 3,
 ):
     """Permutation importance using drop in daily-weighted-mean IC score."""
     if len(X_valid) > n_rows:
@@ -553,7 +567,11 @@ def _perm_importance(
         Xv = X_valid.copy()
         mv = meta_valid.reset_index(drop=True)
 
-    base_pred = predict_fn(Xv)
+    idv = mv["id"].to_numpy() if "id" in mv.columns else None
+    try:
+        base_pred = predict_fn(Xv, idv)
+    except TypeError:
+        base_pred = predict_fn(Xv)
     df_base = mv.copy()
     df_base["pred"] = base_pred
     df_base = apply_pred_postprocess(
@@ -567,20 +585,26 @@ def _perm_importance(
 
     rows = []
     for col in Xv.columns:
-        Xp = Xv.copy()
-        Xp[col] = np.random.RandomState(42).permutation(Xp[col].values)
-        pred = predict_fn(Xp)
-        dfp = mv.copy()
-        dfp["pred"] = pred
-        dfp = apply_pred_postprocess(
-            dfp,
-            pred_col="pred",
-            pipeline=postprocess_pipeline,
-            use_pred_z=use_pred_z,
-            use_neutralize=use_neutralize,
-        )
-        score = daily_weighted_mean_ic(dfp, "pred_post", "y_score", "weight", "date")
-        rows.append({"feature": col, "importance": base - score})
+        deltas = []
+        for r in range(max(1, n_repeats)):
+            Xp = Xv.copy()
+            Xp[col] = np.random.RandomState(42 + r).permutation(Xp[col].values)
+            try:
+                pred = predict_fn(Xp, idv)
+            except TypeError:
+                pred = predict_fn(Xp)
+            dfp = mv.copy()
+            dfp["pred"] = pred
+            dfp = apply_pred_postprocess(
+                dfp,
+                pred_col="pred",
+                pipeline=postprocess_pipeline,
+                use_pred_z=use_pred_z,
+                use_neutralize=use_neutralize,
+            )
+            score = daily_weighted_mean_ic(dfp, "pred_post", "y_score", "weight", "date")
+            deltas.append(base - score)
+        rows.append({"feature": col, "delta_ic": float(np.mean(deltas)), "std": float(np.std(deltas)), "n_repeats": int(max(1, n_repeats))})
     return pd.DataFrame(rows)
 
 
@@ -600,10 +624,80 @@ def main() -> None:
     parser.add_argument("--grid_seed", type=int, default=42, help="Random seed for param sampling.")
     parser.add_argument("--n_jobs", type=int, default=16, help="CPU threads per model (rf/extra/lgbm/xgb/catboost).")
     parser.add_argument("--label_mode", type=str, default="raw", help="Label mode: raw | winsor_csz | neu_winsor_csz.")
-    parser.add_argument("--dv_log1p", action=argparse.BooleanOptionalAction, default=True, help="Apply log1p to dv_*.")
-    parser.add_argument("--add_time_features", action=argparse.BooleanOptionalAction, default=True, help="Add cyclical time features.")
-    parser.add_argument("--add_market_state_features", action=argparse.BooleanOptionalAction, default=True, help="Add market state features.")
-    parser.add_argument("--add_industry_state_features", action=argparse.BooleanOptionalAction, default=True, help="Add industry state features.")
+    parser.add_argument(
+        "--run_factor_ic",
+        "--run-factor-ic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run single-factor IC sanity check on train split.",
+    )
+    parser.add_argument(
+        "--include_missing_features",
+        "--include-missing-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include missingness indicator/count features in model input.",
+    )
+    parser.add_argument(
+        "--include_time_constant_features",
+        "--include-time-constant-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include dow_/mon_/mkt_ columns in model input.",
+    )
+    parser.add_argument(
+        "--drop_redundant_features",
+        "--drop-redundant-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop redundant features such as ret_last/rev_30m.",
+    )
+    parser.add_argument(
+        "--use_id_embedding",
+        "--use-id-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use torch id embedding.",
+    )
+    parser.add_argument("--id_emb_dim", type=int, default=8, help="Embedding dim for id embedding.")
+    parser.add_argument("--id_dropout_p", type=float, default=0.1, help="Entity dropout probability for id embedding.")
+    parser.add_argument(
+        "--use_id_encoding",
+        "--use-id-encoding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use tabular id target encoding feature.",
+    )
+    parser.add_argument("--id_te_alpha", type=float, default=50.0, help="Smoothing alpha for id target encoding.")
+    parser.add_argument("--id_te_folds", type=int, default=5, help="Fold count for OOF id target encoding.")
+    parser.add_argument(
+        "--dv_log1p",
+        "--dv-log1p",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply log1p to dv_*.",
+    )
+    parser.add_argument(
+        "--add_time_features",
+        "--add-time-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add cyclical time features.",
+    )
+    parser.add_argument(
+        "--add_market_state_features",
+        "--add-market-state-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add market state features.",
+    )
+    parser.add_argument(
+        "--add_industry_state_features",
+        "--add-industry-state-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add industry state features.",
+    )
     parser.add_argument("--x_winsorize_by_date", action="store_true", help="Feature winsorization by date (X only).")
     parser.add_argument("--x_zscore_by_date", action="store_true", help="Feature z-score by date (X only).")
     parser.add_argument("--data_workers", type=int, default=4, help="Parallel workers for daily data loading.")
@@ -633,13 +727,11 @@ def main() -> None:
         raise ValueError("label_mode must be one of: raw | winsor_csz | neu_winsor_csz")
 
     run_dir = Path("res/experiments") / args.run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    dirs = make_run_dirs(run_dir, enable_debug=args.debug or args.dump_debug_snapshots)
     (run_dir / "predictions").mkdir(exist_ok=True)
-    (run_dir / "plots").mkdir(exist_ok=True)
+    (run_dir / "plots").mkdir(exist_ok=True)  # backward compatibility
     (run_dir / "ic_series").mkdir(exist_ok=True)
-    (run_dir / "debug").mkdir(exist_ok=True)
-    (run_dir / "ablation").mkdir(exist_ok=True)
-    (run_dir / "feature_importance").mkdir(exist_ok=True)
+    (run_dir / "feature_importance").mkdir(exist_ok=True)  # backward compatibility
     (run_dir / "tuning").mkdir(exist_ok=True)
     (run_dir / "tuning" / "torch_loss").mkdir(parents=True, exist_ok=True)
 
@@ -662,6 +754,17 @@ def main() -> None:
         "grid_seed": args.grid_seed,
         "n_jobs": args.n_jobs,
         "label_mode": args.label_mode,
+        "run_factor_ic": args.run_factor_ic,
+        "include_missing_features": args.include_missing_features,
+        "include_time_constant_features": args.include_time_constant_features,
+        "exclude_time_constant_features": (not args.include_time_constant_features),
+        "drop_redundant_features": args.drop_redundant_features,
+        "use_id_embedding": args.use_id_embedding,
+        "id_emb_dim": args.id_emb_dim,
+        "id_dropout_p": args.id_dropout_p,
+        "use_id_encoding": args.use_id_encoding,
+        "id_te_alpha": args.id_te_alpha,
+        "id_te_folds": args.id_te_folds,
         "dv_log1p": args.dv_log1p,
         "add_time_features": args.add_time_features,
         "add_market_state_features": args.add_market_state_features,
@@ -683,7 +786,7 @@ def main() -> None:
         "debug_n_features": args.debug_n_features,
         "debug": args.debug,
     }
-    (run_dir / "config.json").write_text(json.dumps(config, indent=2))
+    save_config(run_dir, config)
 
     model_list = args.models.split(",") if args.models else list(MODEL_SPECS.keys())
     model_list = [m for m in model_list if m in MODEL_SPECS]
@@ -694,6 +797,7 @@ def main() -> None:
     pred_cache = {}
     splits = _get_splits(args.split_mode)
     config["splits"] = splits
+    save_config(run_dir, config)
 
     for fold_idx, split in enumerate(tqdm(splits, desc="Folds", ncols=80)):
         print(f"[Step1] Load data (fold {fold_idx})")
@@ -866,6 +970,35 @@ def main() -> None:
         df_valid["y_score"] = df_valid["y_label"]
         df_test["y_score"] = df_test["y_label"]
 
+        # Build tabular id target encoding (OOF on train), enabled by feature selection variants.
+        te_train, te_state = fit_transform_id_te(
+            df_train[df_train["y_label"].notna()],
+            id_col="id",
+            y_col="y_score",
+            date_col="date",
+            folds=args.id_te_folds,
+            alpha=args.id_te_alpha,
+        )
+        df_train.loc[te_train.index, "id_te"] = te_train.values
+        df_valid["id_te"] = transform_id_te(df_valid, te_state, id_col="id")
+        df_test["id_te"] = transform_id_te(df_test, te_state, id_col="id")
+
+        # Chapter-1 profiling artifacts from train split.
+        run_data_profile(
+            df_train,
+            tables_dir=dirs["tables"],
+            figures_dir=dirs["figures"],
+            y_col="y_raw",
+            weight_col="weight",
+        )
+
+        if args.run_factor_ic:
+            feat_scan = default_factor_cols(df_train)
+            factor_tbl = compute_factor_table(df_train, feat_scan, label_col="y_score", weight_col="weight", date_col="date")
+            save_table(factor_tbl, dirs["factor_ic"] / "factor_ic_table.csv")
+            plot_factor_ic_top20(factor_tbl, dirs["factor_ic"] / "factor_ic_top20.png")
+            plot_factor_ic_hist(factor_tbl, dirs["factor_ic"] / "factor_ic_hist.png")
+
         if args.dump_debug_snapshots:
             _dump_debug_snapshots(
                 df_train,
@@ -891,10 +1024,39 @@ def main() -> None:
             print("[DEBUG] y_label valid stats:", _stat(df_valid["y_label"]))
 
         print(f"[Step3] Building train/valid/test matrices (fold {fold_idx})")
-        X_train, y_train, w_train, feature_names, state = fit_transform_train(df_train, label_col="y_label")
-        X_valid, y_valid, w_valid = transform_eval(df_valid, state, label_col="y_label")
-        X_test, y_test, w_test = transform_eval(df_test, state, label_col="y_label")
+        df_train_main = df_train.copy()
+        df_valid_main = df_valid.copy()
+        df_test_main = df_test.copy()
+        if not args.use_id_encoding:
+            for dfx in (df_train_main, df_valid_main, df_test_main):
+                if "id_te" in dfx.columns:
+                    dfx.drop(columns=["id_te"], inplace=True)
+
+        X_train, y_train, w_train, feature_names, state = fit_transform_train(
+            df_train_main,
+            label_col="y_label",
+            include_missing_features=args.include_missing_features,
+            include_time_constant_features=args.include_time_constant_features,
+            drop_redundant_features=args.drop_redundant_features,
+        )
+        X_valid, y_valid, w_valid = transform_eval(
+            df_valid_main,
+            state,
+            label_col="y_label",
+            include_missing_features=args.include_missing_features,
+            include_time_constant_features=args.include_time_constant_features,
+            drop_redundant_features=args.drop_redundant_features,
+        )
+        X_test, y_test, w_test = transform_eval(
+            df_test_main,
+            state,
+            label_col="y_label",
+            include_missing_features=args.include_missing_features,
+            include_time_constant_features=args.include_time_constant_features,
+            drop_redundant_features=args.drop_redundant_features,
+        )
         feature_groups = _get_feature_groups(feature_names)
+        (dirs["tables"] / "feature_cols_used.txt").write_text("\n".join(feature_names) + "\n")
 
         # Dump torch first batch if requested
         if args.dump_debug_snapshots and any(m.startswith("torch_") for m in model_list):
@@ -933,26 +1095,46 @@ def main() -> None:
 
         meta_train = df_train.loc[
             df_train["y_label"].notna(),
-            ["date", "weight", "y_raw", "y_score", "industry", "beta", "indbeta"],
+            ["id", "date", "weight", "y_raw", "y_score", "industry", "beta", "indbeta"],
         ].reset_index(drop=True)
         meta_valid = df_valid.loc[
             df_valid["y_label"].notna(),
-            ["date", "weight", "y_raw", "y_score", "industry", "beta", "indbeta"],
+            ["id", "date", "weight", "y_raw", "y_score", "industry", "beta", "indbeta"],
         ].reset_index(drop=True)
         meta_test = df_test.loc[
             df_test["y_label"].notna(),
-            ["date", "weight", "y_raw", "y_score", "industry", "beta", "indbeta"],
+            ["id", "date", "weight", "y_raw", "y_score", "industry", "beta", "indbeta"],
         ].reset_index(drop=True)
+
+        # id->idx mapping for optional torch id embedding (0 reserved for UNK).
+        id_train_idx = id_valid_idx = id_test_idx = None
+        if args.use_id_embedding:
+            train_ids = meta_train["id"].astype(str)
+            uniq = sorted(train_ids.unique().tolist())
+            id_map = {k: i + 1 for i, k in enumerate(uniq)}
+            id_train_idx = train_ids.map(id_map).fillna(0).astype(int).to_numpy()
+            id_valid_idx = meta_valid["id"].astype(str).map(id_map).fillna(0).astype(int).to_numpy()
+            id_test_idx = meta_test["id"].astype(str).map(id_map).fillna(0).astype(int).to_numpy()
+            config["id_vocab_size"] = len(id_map) + 1
         valid_dates_arr = meta_valid["date"].to_numpy()
 
-        # Save small sample of train X/y for scale inspection (with id/date)
+        # Save small random sample of train X/y for scale inspection (with id/date)
         sample_n = 1000
         df_train_f = df_train[df_train["y_label"].notna()].reset_index(drop=True)
-        dbg = X_train.head(sample_n).copy()
-        dbg["id"] = df_train_f["id"].head(sample_n).to_numpy()
-        dbg["date"] = df_train_f["date"].head(sample_n).to_numpy()
-        y_dbg = y_train[: len(dbg)]
-        w_dbg = w_train[: len(dbg)]
+
+        n_rows = len(X_train)
+        rng = np.random.default_rng(42)
+        if n_rows <= sample_n:
+            sample_idx = np.arange(n_rows)
+        else:
+            sample_idx = rng.choice(n_rows, size=sample_n, replace=False)
+        sample_idx = np.sort(sample_idx)  # keep row order
+
+        dbg = X_train.iloc[sample_idx].copy()
+        dbg["id"] = df_train_f["id"].iloc[sample_idx].to_numpy()
+        dbg["date"] = df_train_f["date"].iloc[sample_idx].to_numpy()
+        y_dbg = y_train[sample_idx]
+        w_dbg = w_train[sample_idx]
         if hasattr(y_dbg, "ndim") and y_dbg.ndim > 1:
             y_dbg = y_dbg[:, 0]
         if hasattr(w_dbg, "ndim") and w_dbg.ndim > 1:
@@ -994,6 +1176,11 @@ def main() -> None:
                     )
                     train_params["feature_names"] = list(Xtr_use.columns)
                     train_params["valid_dates"] = valid_dates_arr
+                    train_params["use_id_embedding"] = args.use_id_embedding
+                    train_params["id_emb_dim"] = args.id_emb_dim
+                    train_params["id_dropout_p"] = args.id_dropout_p
+                    train_params["id_train"] = id_train_idx
+                    train_params["id_valid"] = id_valid_idx
                 if mname in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}:
                     train_params["feature_names"] = list(Xtr_use.columns)
                 if mname.startswith("torch_"):
@@ -1026,6 +1213,9 @@ def main() -> None:
                     use_neutralize=args.use_neutralize,
                     params=train_params,
                     save_ic=False,
+                    id_train=id_train_idx,
+                    id_valid=id_valid_idx,
+                    id_test=id_test_idx,
                 )
 
             if len(param_list) == 1:
@@ -1038,6 +1228,11 @@ def main() -> None:
                     )
                     train_params["feature_names"] = list(Xtr_use.columns)
                     train_params["valid_dates"] = valid_dates_arr
+                    train_params["use_id_embedding"] = args.use_id_embedding
+                    train_params["id_emb_dim"] = args.id_emb_dim
+                    train_params["id_dropout_p"] = args.id_dropout_p
+                    train_params["id_train"] = id_train_idx
+                    train_params["id_valid"] = id_valid_idx
                 if mname in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}:
                     train_params["feature_names"] = list(Xtr_use.columns)
                 if mname.startswith("torch_"):
@@ -1070,6 +1265,9 @@ def main() -> None:
                     use_neutralize=args.use_neutralize,
                     params=train_params,
                     save_ic=True,
+                    id_train=id_train_idx,
+                    id_valid=id_valid_idx,
+                    id_test=id_test_idx,
                 )
                 if best_params:
                     tune_df = pd.DataFrame([{**best_params, "valid_score": res["valid_score"], "test_score": res["test_score"]}])
@@ -1142,6 +1340,9 @@ def main() -> None:
                 use_neutralize=args.use_neutralize,
                 params=best_params,
                 save_ic=True,
+                id_train=id_train_idx,
+                id_valid=id_valid_idx,
+                id_test=id_test_idx,
             )
             res["params"] = best_params or {}
             print(f"[Step4] Done model: {mname} (fold {fold_idx}) best_valid={res['valid_score']:.6f}")
@@ -1190,6 +1391,12 @@ def main() -> None:
             "y_test": y_test,
             "w_test": w_test,
             "meta_test": meta_test,
+            "id_train_idx": id_train_idx,
+            "id_valid_idx": id_valid_idx,
+            "id_test_idx": id_test_idx,
+            "df_train": df_train,
+            "df_valid": df_valid,
+            "df_test": df_test,
             "best_params_by_model": best_params_by_model,
         }
 
@@ -1204,12 +1411,41 @@ def main() -> None:
     metrics_agg["run_name"] = args.run_name
     metrics_agg["split_mode"] = args.split_mode
     metrics_agg["label_mode"] = args.label_mode
+    metrics_agg = metrics_agg.rename(
+        columns={
+            "train_score": "train_daily_ic",
+            "valid_score": "valid_daily_ic",
+            "test_score": "test_daily_ic",
+        }
+    )
     metrics_agg = metrics_agg[
-        ["model_name", "split_mode", "label_mode", "train_score", "valid_score", "test_score", "run_name"]
+        ["model_name", "split_mode", "label_mode", "train_daily_ic", "valid_daily_ic", "test_daily_ic", "run_name"]
     ]
     metrics_agg.to_csv(run_dir / "metrics.csv", index=False)
+    save_table(metrics_agg, dirs["tables"] / "model_comparison.csv")
+    save_table(
+        metrics_agg[["model_name", "split_mode", "label_mode", "valid_daily_ic", "test_daily_ic"]],
+        dirs["tables"] / "split_comparison.csv",
+    )
 
-    plot_model_comparison(metrics_agg, run_dir / "plots" / "model_comparison.png")
+    plot_model_comparison(
+        metrics_agg.rename(
+            columns={"train_daily_ic": "train_score", "valid_daily_ic": "valid_score", "test_daily_ic": "test_score"}
+        ),
+        run_dir / "plots" / "model_comparison.png",
+    )
+    plot_model_comparison(
+        metrics_agg.rename(
+            columns={"train_daily_ic": "train_score", "valid_daily_ic": "valid_score", "test_daily_ic": "test_score"}
+        ),
+        dirs["figures"] / "model_comparison_bar.png",
+    )
+    plot_model_comparison(
+        metrics_agg.rename(
+            columns={"train_daily_ic": "train_score", "valid_daily_ic": "valid_score", "test_daily_ic": "test_score"}
+        ),
+        dirs["figures"] / "split_comparison.png",
+    )
 
     best = metrics_agg.iloc[0]["model_name"]
     print(f"[Step5] Best model selected: {best}")
@@ -1231,9 +1467,19 @@ def main() -> None:
         best_params = dict(best_params)
         best_params["feature_names"] = feat_names_best
         best_params["valid_dates"] = best_data["meta_valid"]["date"].to_numpy()
+        best_params["id_train"] = best_data.get("id_train_idx")
+        best_params["id_valid"] = best_data.get("id_valid_idx")
+        best_params["use_id_embedding"] = args.use_id_embedding
+        best_params["id_emb_dim"] = args.id_emb_dim
+        best_params["id_dropout_p"] = args.id_dropout_p
     elif best in {"torch_linear", "torch_mlp"}:
         best_params = dict(best_params)
         best_params["valid_dates"] = best_data["meta_valid"]["date"].to_numpy()
+        best_params["id_train"] = best_data.get("id_train_idx")
+        best_params["id_valid"] = best_data.get("id_valid_idx")
+        best_params["use_id_embedding"] = args.use_id_embedding
+        best_params["id_emb_dim"] = args.id_emb_dim
+        best_params["id_dropout_p"] = args.id_dropout_p
     best_model, best_predict_fn = _train_model(
         best,
         Xtr_best,
@@ -1257,8 +1503,12 @@ def main() -> None:
     }
 
     # Daily IC for best model (valid/test)
-    pred_best_valid = best_entry["predict_fn"](best_entry["X_valid"])
-    pred_best_test = best_entry["predict_fn"](best_entry["X_test"])
+    try:
+        pred_best_valid = best_entry["predict_fn"](best_entry["X_valid"], best_data.get("id_valid_idx"))
+        pred_best_test = best_entry["predict_fn"](best_entry["X_test"], best_data.get("id_test_idx"))
+    except TypeError:
+        pred_best_valid = best_entry["predict_fn"](best_entry["X_valid"])
+        pred_best_test = best_entry["predict_fn"](best_entry["X_test"])
     df_best_valid = best_entry["meta_valid"].copy()
     df_best_test = best_entry["meta_test"].copy()
     df_best_valid["pred"] = pred_best_valid
@@ -1284,111 +1534,161 @@ def main() -> None:
     ic_best_valid.to_csv(run_dir / "ic_series" / "valid.csv", index=False)
     ic_best_test.to_csv(run_dir / "ic_series" / "test.csv", index=False)
     plot_daily_ic(ic_best_valid, run_dir / "plots" / "daily_ic_best_valid.png", title=f"Daily IC (valid) - {best}")
+    plot_daily_ic(ic_best_valid, dirs["figures"] / "daily_ic_best_valid.png", title=f"Daily IC (valid) - {best}")
+    plot_daily_ic(ic_best_test, dirs["figures"] / "daily_ic_best_test.png", title=f"Daily IC (test) - {best}")
 
     print("[Step6] Feature ablation start")
-    # Feature ablation
-    groups = _get_feature_groups(best_entry["feature_names"])
     seq_model = best in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}
     seq_required = {f"r_{i}" for i in range(20)} | {f"dv_{i}" for i in range(20)}
-    if args.debug:
-        print("[DEBUG] Feature groups sizes:", {k: len(v) for k, v in groups.items()})
-        print("[DEBUG] Feature groups names:", groups)
+    variant_order = ["CORE", "CORE+ID", "CORE+MISSING", "CORE+ID+MISSING", "FULL", "FULL-ID", "-MISSING", "-IND", "-ECON", "-BETA"]
+    variant_cfg = build_ablation_variants()
     ablation_rows = []
-    # Full-feature baseline (no drop) for comparison
-    full_score = daily_weighted_mean_ic(df_best_valid, "pred_post", "y_score", "weight", "date")
-    ablation_rows.append({"setting": "full", "valid_score": full_score, "is_full": True})
-    for gname, gcols in groups.items():
-        if not gcols:
-            continue
-        if seq_model and not seq_required.issubset(set(gcols)):
-            if args.debug:
-                print(f"[DEBUG] Skip group-only {gname} for seq model (missing r/dv).")
-            continue
-        Xtr_g = best_entry["X_train"][gcols]
-        Xva_g = best_entry["X_valid"][gcols]
-        model_g, pred_fn_g = _train_model(
-            best,
-            Xtr_g,
-            best_entry["y_train"],
-            best_entry["w_train"],
-            Xva_g,
-            best_entry["y_valid"],
-            best_entry["w_valid"],
-            args.gpu_id,
-            args.n_jobs,
-            params=best_params,
-        )
-        pred = pred_fn_g(Xva_g)
-        dfp = best_entry["meta_valid"].copy()
-        dfp["pred"] = pred
-        dfp = apply_pred_postprocess(
-            dfp,
-            pred_col="pred",
-            pipeline=args.postprocess_pipeline,
-            use_pred_z=args.use_pred_z,
-            use_neutralize=args.use_neutralize,
-        )
-        score = daily_weighted_mean_ic(dfp, "pred_post", "y_score", "weight", "date")
-        ablation_rows.append({"setting": f"only_{gname}", "valid_score": score, "is_full": False})
 
-    for gname, gcols in groups.items():
-        if not gcols:
-            continue
-        keep_cols = [c for c in best_entry["feature_names"] if c not in gcols]
+    for vname in variant_order:
+        cfg_v = variant_cfg[vname]
+        use_missing_v = cfg_v["use_missing"]
+        use_id_v = cfg_v["use_id"]
+        use_id_emb_v = bool(use_id_v and best.startswith("torch"))
+        use_id_enc_v = bool(use_id_v and (not best.startswith("torch")))
+
+        dftr_v = best_data["df_train"].copy()
+        dfva_v = best_data["df_valid"].copy()
+        dfte_v = best_data["df_test"].copy()
+        if not use_id_enc_v:
+            for dfx in (dftr_v, dfva_v, dfte_v):
+                if "id_te" in dfx.columns:
+                    dfx.drop(columns=["id_te"], inplace=True)
+
+        Xtr_v, ytr_v, wtr_v, feat_v, st_v = fit_transform_train(
+            dftr_v,
+            label_col="y_label",
+            include_missing_features=use_missing_v,
+            include_time_constant_features=args.include_time_constant_features,
+            drop_redundant_features=args.drop_redundant_features,
+        )
+        Xva_v, yva_v, wva_v = transform_eval(
+            dfva_v,
+            st_v,
+            label_col="y_label",
+            include_missing_features=use_missing_v,
+            include_time_constant_features=args.include_time_constant_features,
+            drop_redundant_features=args.drop_redundant_features,
+        )
+        Xte_v, yte_v, wte_v = transform_eval(
+            dfte_v,
+            st_v,
+            label_col="y_label",
+            include_missing_features=use_missing_v,
+            include_time_constant_features=args.include_time_constant_features,
+            drop_redundant_features=args.drop_redundant_features,
+        )
+
+        keep_cols = filter_variant_columns(list(feat_v), vname, include_missing_features=use_missing_v)
         if seq_model and not seq_required.issubset(set(keep_cols)):
             if args.debug:
-                print(f"[DEBUG] Skip drop-one {gname} for seq model (missing r/dv).")
+                print(f"[DEBUG] Skip variant {vname}: missing required seq cols.")
             continue
-        Xtr_g = best_entry["X_train"][keep_cols]
-        Xva_g = best_entry["X_valid"][keep_cols]
-        model_g, pred_fn_g = _train_model(
-            best,
-            Xtr_g,
-            best_entry["y_train"],
-            best_entry["w_train"],
-            Xva_g,
-            best_entry["y_valid"],
-            best_entry["w_valid"],
-            args.gpu_id,
-            args.n_jobs,
-            params=best_params,
-        )
-        pred = pred_fn_g(Xva_g)
-        dfp = best_entry["meta_valid"].copy()
-        dfp["pred"] = pred
-        dfp = apply_pred_postprocess(
-            dfp,
-            pred_col="pred",
-            pipeline=args.postprocess_pipeline,
-            use_pred_z=args.use_pred_z,
-            use_neutralize=args.use_neutralize,
-        )
-        score = daily_weighted_mean_ic(dfp, "pred_post", "y_score", "weight", "date")
-        ablation_rows.append({"setting": f"drop_{gname}", "valid_score": score, "is_full": False})
+        Xtr_v = Xtr_v[keep_cols]
+        Xva_v = Xva_v[keep_cols]
+        Xte_v = Xte_v[keep_cols]
 
-    ablation_df = pd.DataFrame(ablation_rows)
-    ablation_df.to_csv(run_dir / "ablation" / "ablation.csv", index=False)
-    plot_ablation(ablation_df, run_dir / "ablation" / "ablation.png")
+        meta_tr_v = dftr_v.loc[dftr_v["y_label"].notna(), ["id", "date", "weight", "y_score"]].reset_index(drop=True)
+        meta_va_v = dfva_v.loc[dfva_v["y_label"].notna(), ["id", "date", "weight", "y_score"]].reset_index(drop=True)
+        meta_te_v = dfte_v.loc[dfte_v["y_label"].notna(), ["id", "date", "weight", "y_score"]].reset_index(drop=True)
+
+        id_tr_v = id_va_v = id_te_v = None
+        if use_id_emb_v:
+            id_map_v = {k: i + 1 for i, k in enumerate(sorted(meta_tr_v["id"].astype(str).unique().tolist()))}
+            id_tr_v = meta_tr_v["id"].astype(str).map(id_map_v).fillna(0).astype(int).to_numpy()
+            id_va_v = meta_va_v["id"].astype(str).map(id_map_v).fillna(0).astype(int).to_numpy()
+            id_te_v = meta_te_v["id"].astype(str).map(id_map_v).fillna(0).astype(int).to_numpy()
+
+        p_v = dict(best_params)
+        if best.startswith("torch"):
+            p_v["feature_names"] = list(Xtr_v.columns)
+            p_v["valid_dates"] = meta_va_v["date"].to_numpy()
+            p_v["use_id_embedding"] = use_id_emb_v
+            p_v["id_emb_dim"] = args.id_emb_dim
+            p_v["id_dropout_p"] = args.id_dropout_p
+            p_v["id_train"] = id_tr_v
+            p_v["id_valid"] = id_va_v
+
+        m_v, pred_v = _train_model(
+            best, Xtr_v, ytr_v, wtr_v, Xva_v, yva_v, wva_v, args.gpu_id, args.n_jobs, params=p_v
+        )
+        try:
+            pred_va = pred_v(Xva_v, id_va_v)
+            pred_te = pred_v(Xte_v, id_te_v)
+        except TypeError:
+            pred_va = pred_v(Xva_v)
+            pred_te = pred_v(Xte_v)
+
+        dfpv = meta_va_v.copy()
+        dfpt = meta_te_v.copy()
+        dfpv["pred"] = pred_va
+        dfpt["pred"] = pred_te
+        dfpv = apply_pred_postprocess(
+            dfpv, pred_col="pred", pipeline=args.postprocess_pipeline, use_pred_z=args.use_pred_z, use_neutralize=args.use_neutralize
+        )
+        dfpt = apply_pred_postprocess(
+            dfpt, pred_col="pred", pipeline=args.postprocess_pipeline, use_pred_z=args.use_pred_z, use_neutralize=args.use_neutralize
+        )
+        valid_sc = daily_weighted_mean_ic(dfpv, "pred_post", "y_score", "weight", "date")
+        test_sc = daily_weighted_mean_ic(dfpt, "pred_post", "y_score", "weight", "date")
+        ablation_rows.append(
+            {
+                "variant_name": vname,
+                "model_name": best,
+                "split_mode": args.split_mode,
+                "label_mode": args.label_mode,
+                "valid_score": valid_sc,
+                "test_score": test_sc,
+                "n_features": len(keep_cols),
+            }
+        )
+        (dirs["ablation"] / f"variant_{vname}_feature_cols.txt").write_text("\n".join(keep_cols) + "\n")
+
+    add_df, drop_df = make_ablation_tables(ablation_rows)
+    save_table(add_df, dirs["ablation"] / "ablation_addone.csv")
+    save_table(drop_df, dirs["ablation"] / "ablation_dropone.csv")
+    if not drop_df.empty:
+        plot_ablation(
+            drop_df.rename(columns={"variant_name": "setting", "valid_score": "valid_score"}),
+            run_dir / "ablation" / "ablation.png",
+        )
     print("[Step6] Feature ablation done")
 
     print("[Step7] Feature importance start")
     # Feature importance
     fi_rows = []
     model = best_entry["model"]
+    feat_for_best = list(best_entry["X_valid"].columns)
     if hasattr(model, "feature_importances_"):
         fi = model.feature_importances_
-        fi_rows = [{"feature": f, "importance": float(v)} for f, v in zip(feature_names, fi)]
+        fi_rows = [{"feature": f, "importance": float(v)} for f, v in zip(feat_for_best, fi)]
     elif hasattr(model, "booster_"):
         try:
-            fi = model.booster_.feature_importance(importance_type="gain")
-            fi_rows = [{"feature": f, "importance": float(v)} for f, v in zip(feature_names, fi)]
+            booster = model.booster_
+            names = list(booster.feature_name()) if hasattr(booster, "feature_name") else feat_for_best
+            gain = booster.feature_importance(importance_type="gain")
+            split = booster.feature_importance(importance_type="split")
+            fi_rows = [{"feature": f, "gain": float(g), "split_count": float(s)} for f, g, s in zip(names, gain, split)]
         except Exception:
             fi_rows = []
 
     if fi_rows:
-        fi_df = pd.DataFrame(fi_rows).sort_values("importance", ascending=False)
-        fi_df.to_csv(run_dir / "feature_importance" / "builtin.csv", index=False)
-        plot_feature_importance(fi_df, run_dir / "feature_importance" / "builtin.png")
+        fi_df = pd.DataFrame(fi_rows)
+        if "gain" in fi_df.columns:
+            fi_df = fi_df.sort_values("gain", ascending=False)
+            save_table(fi_df, dirs["importance"] / "lgbm_gain_importance.csv")
+            plot_feature_importance(
+                fi_df.rename(columns={"gain": "importance"})[["feature", "importance"]],
+                dirs["figures"] / "lgbm_gain_top30.png",
+            )
+        else:
+            fi_df = fi_df.sort_values("importance", ascending=False)
+            save_table(fi_df, dirs["importance"] / "builtin_importance.csv")
+            plot_feature_importance(fi_df, dirs["figures"] / "builtin_importance_top30.png")
 
     # Permutation importance
     perm_df = _perm_importance(
@@ -1399,9 +1699,13 @@ def main() -> None:
         postprocess_pipeline=args.postprocess_pipeline,
         use_pred_z=args.use_pred_z,
         use_neutralize=args.use_neutralize,
+        n_repeats=3,
     )
-    perm_df.to_csv(run_dir / "feature_importance" / "permutation.csv", index=False)
-    plot_feature_importance(perm_df, run_dir / "feature_importance" / "permutation.png")
+    save_table(perm_df, dirs["importance"] / "permutation_importance.csv")
+    plot_feature_importance(
+        perm_df.rename(columns={"delta_ic": "importance"})[["feature", "importance"]],
+        dirs["figures"] / "permutation_top30.png",
+    )
     print("[Step7] Feature importance done")
 
     # Optional SHAP
@@ -1418,6 +1722,8 @@ def main() -> None:
             plot_feature_importance(shap_df, run_dir / "feature_importance" / "shap.png")
     except Exception:
         pass
+
+    save_config(run_dir, config)
 
 
 if __name__ == "__main__":

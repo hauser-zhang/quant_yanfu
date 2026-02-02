@@ -1,114 +1,418 @@
-# 量化项目报告（唯一指标：Daily-Weighted-Mean IC）
+# 量化项目研究报告
 
-## 唯一评估指标（Daily-Weighted-Mean IC）
-对每个交易日 *t*：
-
-- **日内 IC**：
-  \[ IC_t = weighted\_corr(y_t, \hat{y}_t, w_t) \]
-
-- **日权重**：
-  \[ W_t = \sum_i w_{t,i} \]
-
-- **最终评分（唯一指标）**：
-  \[ SCORE = \frac{\sum_t W_t \cdot IC_t}{\sum_t W_t} \]
-
-**说明**：该 SCORE 是唯一指标，用于模型选择、调参、消融、特征重要性、`metrics.csv` 和全部图表。
+> 目标：使用每只股票当日的日内收益/成交金额序列特征（r_0~r_19, dv_0~dv_19）及慢变基本面特征（f_0~f_9）等，预测未来 1 天个股收益，并以 **daily-weighted-mean IC** 作为唯一评估标准构建与迭代模型。  
+> 注：本文严格区分“已实现/已跑结果”与“计划但未实现”部分（如 Transformer）。
 
 ---
 
-## 1. 初步数据分析（特征类型、经济学含义、权重weight解释、基本统计图、缺失情况、y分布、简单单因子IC sanity check）
-- **特征类型**：
-  - `r_0..r_19`：半小时收益，反映短期动量/反转
-  - `dv_0..dv_19`：成交额，反映流动性与冲击
-  - `f_0..f_9`：慢变量基本面
-  - `industry/beta/indbeta`：行业与风险暴露
-- **权重解释**：`weight` 同时用于训练与评估中的加权相关，强调重要样本。
-- **基本统计与缺失**：见 `res/data-statics/`（分布图、缺失率、`metadata.csv`）。
-- **sanity check**：用简单单因子（如短期动量）计算日内 IC，确认方向合理。
 
-**改进模板**：
-“发现/证据 → 假设 → 改进方法 → 经济学意义 → 实验结果（引用 `res/experiments/{RUN_NAME}`）→ 小结”。
+## 1. 初步数据分析
 
----
+### 1.1 数据与任务定义
 
-## 2. 数据预处理 & 特征工程（winsorize_by_date、按日标准化、标签处理y_csz/y_rankgauss的动机；构建mom_30m等多窗口特征及其经济学意义）
-- **winsorize_by_date（非加权分位数）**：按日裁剪极端值，降低异常冲击。
-- **按日标准化**：可选，用于降低尺度差异（非主实验轴）。
-- **标签处理动机**：
-  - `y_csz`/`rank-gauss` 有助于缓解分布偏态、提升稳定性（作为背景动机说明）。
-- **当前仅保留 3 种标签模式（严格）**：
-  - **raw**：`y_train = y_raw`，`y_score = y_raw`
-  - **winsor_csz**：`y_train = cs_zscore_by_date(winsorize_by_date(y_raw))`，`y_score` 同 `y_train`
-  - **neu_winsor_csz**：
-    1) **label 中性化**（按日 WLS，行业+beta+indbeta）得到残差 `y_neu`
-    2) `y_train = cs_zscore_by_date(winsorize_by_date(y_neu))`，`y_score` 同 `y_train`
+- 数据区间：2016-01-01 至 2020-12-31（日频）。  
+- 存储形式：每日一个文件 `YYYY/MM/DD/data_matrix.csv(.gz)`。  
+- 样本粒度：每行 = (date, stock_id) 的横截面观测。  
+- 预测目标：`y` = 未来 1 天的个股收益（标量）。  
+- 权重：`weight` 为每条样本的加权系数。
 
-**改进模板**：
-“发现/证据 → 假设 → 改进方法 → 经济学意义 → 实验结果 → 小结”。
+日内特征含义（以 30min 桶为单位）：
+- `r_i`：过去第 (i+1) 到 i 个 30 分钟的收益（例：`r_7` = 240min→210min 的收益）。  
+- `dv_i`：过去第 (i+1) 到 i 个 30 分钟的成交金额（交易额）。  
+- `f_0~f_9`：慢变、已正态化处理的基本面/风格类特征。  
+- `industry`：行业分类（整数；工程里通常 one-hot）。  
+- `beta` / `indbeta`：对市场与行业的风险暴露（未正态化；详见 1.2）。
+
+任务性质：
+- 是比较典型的 **横截面排序/alpha 预测**问题，使用前一日内的市场时序交易量、个股收益以及基本面信息等特征来预测未来一日的收益。  
+- 评价指标按“日”为单位计算横截面相关，最终看跨日平均表现，因此对“可泛化、跨市场状态稳健的信号”要求更高。
 
 ---
 
-## 3. 初步模型构建（统一训练设置；对比 ridge/elasticnet/rf/extra_trees/lgbm/MLP；唯一指标= daily-weighted-mean IC）
-- 模型：ridge / elasticnet / rf / extra_trees / lgbm / torch_mlp
-- 训练使用样本权重；Torch 使用加权 MSE：
-  \[ \mathcal{L} = \frac{\sum_i w_i (\hat{y}_i - y_i)^2}{\sum_i w_i} \]
-- **唯一指标**：Daily-Weighted-Mean IC
-- 结果查看：`res/experiments/{RUN_NAME}/metrics.csv`
+### 1.2 特征类型与经济学含义
 
-**改进模板**：
-“发现/证据 → 假设 → 改进方法 → 经济学意义 → 实验结果 → 小结”。
+1) **短期价格行为：r_0~r_19**  
+反映日内价格路径：  
+- 近端收益（r_0、r_1）通常承载短线动量/反转信号；  
+- 更远端收益（如 r_10~r_19）更接近“当天更早的走势”，可能与次日延续/修正相关。
 
----
+2) **流动性与交易强度：dv_0~dv_19**  
+交易额序列反映日内活跃度与冲击：  
+- 交易额放大往往对应信息到达/资金冲击；  
+- 但 dv 分布重尾极强，通常需要 `log1p` 压缩尾部，再做按日标准化，否则模型易被极端值主导。
 
-## 4. 特征重要性分析&消融实验（best model；gain/permutation；group-only和drop-one；解释Top特征的经济学意义）
-- Best model 由 valid_score 选择
-- Gain/Permutation importance
-- Group-only 与 Drop-one 消融
+3) **基本面特征：f_0~f_9**  
+反映跨日缓慢变化的公司属性/风格暴露，常用于解释中期收益差异或作为风险控制信息。
 
-**改进模板**：
-“发现/证据 → 假设 → 改进方法 → 经济学意义 → 实验结果 → 小结”。
+4) **行业类别信息：industry（one-hot）**  
+行业信息在横截面中通常强相关于收益（行业轮动、宏观敏感度差异）。  
+但行业暴露并不等同于 alpha，需要通过中性化或对照实验区分“行业 beta”与“个股特异信号”。
 
----
-
-## 5. 深度学习方法（MLP基线 -> 1D-CNN/TCN -> RNN -> Transformer；同样做消融与指标对齐；说明为何先CNN后Transformer）
-- 统一使用唯一指标 SCORE
-- 先 CNN/TCN 捕捉局部结构，再考虑 Transformer 的全局依赖
-- **推荐默认超参数（稳定基线）**：
-  - `lr=3e-4`, `batch=2048`, `weight_decay=1e-4`, `dropout=0.2`, `grad_clip=1.0`
-  - `epochs=30`, `early_stop_patience=6`, `ic_every=1`, `scheduler=plateau_ic`
-  - `cnn_channels=[16,32]`, `kernel=3`, `rnn_hidden=32`
+5) **风险暴露：beta / indbeta**  
+- `beta`：个股对全市场收益的敏感度（市场风险暴露）。  
+- `indbeta`：个股对行业收益的敏感度（行业风险暴露）。  
+经济学意义：beta 高的股票在“市场上行/下行”时反应更大；indbeta 类似但针对行业。  
+在 alpha 研究中，常通过“中性化”剥离这些系统性暴露，以更聚焦于 residual alpha（详见第 7 章）。
 
 ---
 
-## 6. 不同数据集划分方式的影响（simple vs forward；解释为何forward更能反映regime shift）
-- **simple**：2016-2018 训练，2019 验证，2020 测试
-- **forward**：滚动训练，模拟 regime shift
+### 1.3 权重 weight 的含义与影响
+
+本项目唯一评价标准采用加权相关（权重为 `weight`）。一个可解释的理解是：  
+- `weight` 常用于代表样本的“经济重要性/可交易规模/置信度/流动性权重”等。  
+- 权重越大，意味着该股票在评估目标中占比越大，模型需要更重视这些样本的排序正确性。
+
+以一个单日样本（2016-01-07 的股票）为例，weight 均值约 1.7 万，最大值约 7.2 万，量级差异明显。这提示：  
+- 训练 loss 若按样本权重加权，会更偏向拟合大权重股票；  
+- 评估按日做加权相关，也会更强调大权重股票对相关系数的贡献。  
+因此后续所有 sanity check、单因子分析、模型评估都必须严格使用 `weight`。
 
 ---
 
-## 7. 中性化/缺失值处理等（pred_neutralize_by_date、neutral_then_z顺序、行业/风险暴露剥离的意义；缺失指示/填补策略）
-- **label 中性化（核心定义）**：
-  - 每日构造暴露矩阵 \(X_t = [1, industry\_onehot, beta, indbeta]\)
-  - 加权最小二乘：\(\arg\min \sum_i w_i (y_i - X_i\theta)^2\)
-  - 残差作为中性化后标签
-  - **缺失处理**：缺失暴露的样本不参与回归，但残差取原 y（fallback）
-- **预测中性化** 保留为可选开关（非主实验轴）。
+### 1.4 缺失情况与数据质量
+
+缺失值是本任务的核心工程难点之一。我们观察到两类缺失模式：
+
+1) **零星缺失**：同一列在少数股票上缺失（可能由停牌、交易异常、数据对齐问题导致）。  
+2) **整列缺失（更严重）**：某些日期下，某些 r/dv 桶对几乎所有股票都缺失。
+
+以单日样本（2016-01-07）为例：
+- `r_16~r_19` 与 `dv_16~dv_19` 在该日**缺失严重**
+- 这些桶在该日无法提供信息；  
+- 若在大量日期都如此，继续保留会带来无信息噪声维度，拖慢训练并可能诱发过拟合。
+
+我们因此在工程上采用两阶段策略：
+- **统计筛除**：对全样本统计每个 `r_i/dv_i` 的缺失率与“按日整列缺失频率”，若某列长期无效（如缺失率 > 95%），直接从特征中移除，结果如下图所示：  
+![](res/experiments/DL_5__simple__winsor_csz__xw1_xz1__dv1_tf1_mkt1_ind1__q0.02-0.98_n50__sd0/figures/missingness_top30.png)
+大部分输入特征缺失率均较小（<1%）。
+- **缺失显式建模**：不移除特征列，对存在缺失的列，采用 `fillna(0)` + 缺失指示/缺失计数特征（可开关）让模型区分“真实 0”与“缺失填 0”。  
 
 ---
 
-## 8. 总结（最终方案、关键结论、下一步改进方向）
-- 唯一指标：Daily-Weighted-Mean IC
-- 关键结论：标签处理与中性化顺序显著影响稳定性
-- 下一步：更丰富的多窗口特征、时序模型与风险约束
+### 1.5 y 分布与标签版本
+
+原始标签 `y` 代表未来 1 天收益，通常具有：
+- 尖峰厚尾（heavy-tail）  
+- 不同日期波动水平不同（cross-day volatility heterogeneity）
+
+因此训练与评估会使用标签变换版本（在工程中用 `y_score` 表示“用于建模与评分的一致口径标签”），常见选择包括：
+- `winsor_csz`：按日 winsorize 后做横截面 z-score，强调当日相对排序。  
+- `neu_winsor_csz`：在 `winsor_csz` 基础上先对行业/风险暴露中性化（回归残差），更接近 residual alpha。  
+（详见第 2 章与第 7 章。）
 
 ---
 
-## How to run
-1) 运行主 notebook：`src/notebooks/run_pipeline.ipynb`
-2) 生成脚本：`scripts/{RUN_NAME}/run_all.sh`
-3) 执行：`bash scripts/{RUN_NAME}/run_all.sh`
+### 1.6 单因子 IC sanity check
 
-输出目录：
-- `res/experiments/{RUN_NAME}/metrics.csv`
-- `res/experiments/{RUN_NAME}/plots/`
-- `res/experiments/{RUN_NAME}/ic_series/`
+目的：在复杂模型之前，先验证“输入特征是否存在可预测性线索”，并识别：
+- 最有信息的基础特征（如近端动量、交易额冲击等）；  
+- 可能只是“暴露类信号”的特征（industry/beta）；  
+- 明显无效或噪声很大的特征（长期整列缺失的 r/dv 桶）。
+
+方法定义：对每个输入特征 x，计算其与 `y_score` 的 **daily-weighted-mean IC**：
+- 每天计算横截面加权相关 `IC_t(x) = weighted_corr(x_t, y_score_t, w_t)`  
+- 再按日权重 `W_t = sum_i w_{t,i}` 做跨日加权平均  
+- 同时报告 `IC_std` 与 `IC_IR = mean/std` 作为稳定性度量
+
+输出文件：
+- `res/experiments/{RUN_NAME}/factor_ic/factor_ic_table.csv`  
+- `res/experiments/{RUN_NAME}/factor_ic/factor_ic_top20.png`  
+（如启用更多图：`factor_ic_hist.png`）
+
+解释原则：
+- 单因子 IC 仅衡量“线性边际预测能力”；多因子/非线性模型可能利用交互与非线性获得额外收益。  
+- industry/beta 等“暴露类特征”即使 IC 较高，也不必然代表可交易 alpha，需要在中性化/消融实验中进一步验证。
+
+---
+
+## 2. 数据预处理 & 特征工程
+
+### 2.1 输入特征预处理：dv_log1p、winsorize_by_date、按日标准化
+
+由于 dv 分布重尾，且不同日期横截面尺度不同，输入特征预处理采取以下流程（可通过开关控制）：
+
+1) **dv_log1p**  
+对 `dv_0~dv_19` 先做：
+`dv <- log1p(max(dv,0))`  
+动机：压缩极端尾部，避免模型被少数超大交易额样本支配。
+
+2) **winsorize_by_date**  
+对每个日期横截面，按分位截断极端值（如 1%/99%），减少异常点影响。
+
+3) **按日标准化（x_zscore_by_date）**  
+对每个日期横截面，将连续特征做 z-score，将所有特征标准化、scale对齐。  
+动机：消除跨日尺度差异，使模型更聚焦当日横截面相对差异（与 IC 目标对齐），同时使得各个特征的scale接近，避免某些特征值太大导致其他特征被掩盖。
+
+
+---
+
+### 2.2 标签处理：y_raw / winsor_csz / neu_winsor_csz
+
+为了使训练目标与评分口径一致，我们将“训练标签”和“评分标签”统一在同一 label space（记为 `y_score`）。常用模式：
+
+1) **winsor_csz**  
+   - 按日 winsorize（截尾）  
+   - 按日做横截面 z-score：`y_csz = (y - mean_t) / std_t`  
+   意义：强调当日相对收益排序，弱化跨日波动差异。
+
+2) **neu_winsor_csz（标签中性化）**  
+在 `winsor_csz` 前或后，对行业与风险暴露做回归：
+   - `y ~  beta*all + indbeta*industry + residual_alpha`  
+   取残差作为标签，再做按日标准化（或相反顺序需明确并固定）。  
+   意义：剥离系统性暴露，使目标更接近 residual alpha，提升可解释性。
+
+---
+
+### 2.3 经济学特征构建（示例与解释）
+
+在原始 r/dv 基础上构建多窗口聚合特征，以显式表达常见的经济学信号（动量、反转、波动、流动性冲击）：
+
+1) **动量（Momentum）类**  
+   - `mom_30m`：近 30min 收益（通常接近 r_0）  
+   - `mom_2h`：近 2 小时累计收益（例如 sum(r_0..r_3)）  
+   - `mom_6h`：更长窗口累计收益（视有效 r 桶缺失情况选择）  
+   经济学解释：短期趋势延续/信息扩散导致的收益延续效应。
+
+2) **反转（Reversal）类**  
+   - `rev_30m`：近端收益的反向项（若完全等价于 -r_0，属于冗余项应默认剔除）  
+经济学解释：微观结构噪声、流动性提供导致的短期价格回撤。
+
+3) **波动（Volatility）类**  
+   - `vol_2h`：近 2 小时收益波动（std/abs sum 等）  
+   经济学解释：波动上升可能反映信息不确定性与风险补偿，也可能代表噪声上升，需要模型学习其方向性。
+
+4) **流动性冲击（Liquidity Shock）类**  
+   - `dv_log_sum_2h`：近 2 小时交易额（log1p 后聚合）  
+   - `dv_shock`：交易额相对自身历史/当日其他桶的异常程度  
+   经济学解释：资金冲击/信息事件导致的交易活跃度异常，可能与次日继续定价相关。
+
+冗余控制：
+   - 对明显重复或线性等价特征（如 `ret_last` 与 `r_0` 完全一致，`rev_30m` 与 `-r_0` 等价），默认从输入中移除，避免增加噪声维度与过拟合风险。
+
+---
+
+### 2.4 行业状态特征 ind_*
+
+`ind_*` 为 date×industry 聚合后回填到个股，因此在同一天横截面中因行业不同而不同，能有效影响排序。
+
+示例：
+- `ind_r_mean/std`：行业内收益水平/波动  
+- `ind_dv_mean/std`：行业内交易活跃度水平/离散度  
+经济学解释：行业轮动与行业层面的资金/信息冲击会影响行业内个股次日表现与风险补偿。
+
+---
+
+### 2.5 个股 ID 信息
+
+由于 ID 信息可能吸收“个体固定效应”（流动性、长期风险属性、数据质量模式等），我们将其作为可控增强项，并通过消融/对照实验验证其可泛化性：
+
+- **Torch：id embedding（端到端学习向量表示）**  
+  风险：容易记忆个股噪声导致过拟合。  
+- **Tabular（LGBM/Sklearn）：id encoding（OOF target/mean encoding）**  
+  采用训练集内部 K-fold out-of-fold 方式生成 `id_te`，避免标签泄漏。  
+
+默认策略：关闭 ID 信息，只有在对照实验/最终模型候选中才开启。
+
+---
+
+### 2.6 Missing 信息特征
+
+当采用 `fillna(0)` 时，模型若不知道哪些值是缺失，会把“缺失填 0”当成真实 0，可能引入系统误差。  
+因此提供可选 missing 特征：
+- `r_missing_cnt`, `dv_missing_cnt`  
+- `beta_isna`, `indbeta_isna`, `any_f_missing`, `industry_isna`
+
+经济学解释：缺失往往对应停牌/低流动性/数据对齐失败等状态，可能与次日收益和风险显著相关。  
+
+---
+
+## 3. 初步模型构建（机器学习模型）
+
+### 3.1 统一训练设置
+
+- 数据切分：支持 simple split 与 forward split（第 6 章对比）   
+- 唯一指标：**daily-weighted-mean IC**（按日加权相关，再跨日加权平均）
+
+- 输出位置：`res/experiments/{RUN_NAME}/metrics/metrics.csv`
+
+---
+
+### 3.2 Baselines（tabular ML）
+
+已实现对比模型：
+- Ridge / ElasticNet（线性，强正则）
+- RandomForest / ExtraTrees（非线性树集成）
+- LightGBM（梯度提升树）
+- 简单MLP模型（基于Torch实现）
+
+不同模型性能比较如下：
+- LGBM valid 约 0.058（daily mean 口径），test 约 0.017  
+- ElasticNet test 约 0.058（daily mean 口径）  
+提示：不同口径/不同 split 下可能差异显著，需以“唯一指标 daily-weighted-mean IC + 统一 split”重新跑并确认结论。
+
+---
+
+### 3.3 误差来源与下一步改进（ML 部分）
+
+- 尺度与重尾：dv 需 log1p + 按日标准化  
+- 缺失与整列缺失：长期无效列应删除；剩余缺失需 missing 特征辅助  
+- 过拟合：树模型可用更强正则（min_data_in_leaf、subsample、feature_fraction）；线性模型关注标准化与稳健标签  
+- regime shift：必须用 forward split 检验稳定性（第 6 章）
+
+---
+
+## 4. 深度学习方法
+
+### 4.1 MLP
+
+作为深度学习最简单基线，其性能能够
+
+---
+
+### 4.2 1D-CNN / TCN（已实现部分 / 或进行中）
+
+- CNN 用于从 (r_i, dv_i) 的短序列中提取局部模式（如近端动量、交易额冲击）。  
+- TCN（dilated conv）在短序列上常比 RNN 稳定，并具备更大感受野，适合作为 CNN 的升级路线。
+
+关键工程注意：
+- 序列顺序必须统一为 **old→new（r_19..r_0, dv_19..dv_0）**，保证“最后时刻=最新信息”。  
+- dv 建议在进入模型前已 log1p 并标准化，避免梯度被 dv 量纲主导。
+
+---
+
+### 4.3 RNN/LSTM/GRU（已实现部分 / 或进行中）
+
+RNN 系列适合学习序列依赖，但更容易过拟合与训练不稳。建议：
+- 小 hidden（32 起步）、强正则（AdamW + weight_decay + grad clip）  
+- early stop 与 best checkpoint 以 valid daily IC 为准（训练 loss 不变）
+
+---
+
+### 4.4 Transformer（未实现，计划）
+
+Transformer 适用于更长序列与跨日建模（例如把过去 N 天的特征序列作为输入）。  
+当前项目的日内序列只有 20 个时间步，Transformer 不一定优于 CNN/TCN；更合理的应用场景是“跨日序列”（需要额外特征构建与数据对齐）。
+
+【计划】后续若实现，将在同一指标与 split 下与 CNN/TCN 做严格对比，并配套消融实验。
+
+---
+
+## 5. 特征重要性分析 & 消融实验
+
+### 5.1 重要性方法
+
+- 对树模型（LGBM）：使用 gain importance（分裂增益）  
+- 通用方法：permutation importance（在验证集打乱某列观察 IC 下降）
+
+输出位置：
+- `res/experiments/{RUN_NAME}/importance/gain_importance.csv`
+- `res/experiments/{RUN_NAME}/importance/permutation_importance.csv`
+
+---
+
+### 5.2 消融实验设计（核心：Drop-one + Add-one）
+
+为避免“默认关闭导致 drop 无意义”的问题，我们采用两条主线：
+
+A) Core baseline（默认关闭 ID/MISSING）  
+- `CORE`  
+- `CORE + ID`  
+- `CORE + MISSING`  
+- `CORE + (ID+MISSING)`（可选）
+
+B) Extended FULL（显式开启 ID/MISSING 等增强项）  
+- `FULL`  
+- `FULL - ID`  
+- `FULL - MISSING`  
+- `FULL - IND`（去 industry onehot + ind_*）  
+- `FULL - ECON`（去动量/反转/波动/流动性冲击等工程特征）  
+- `FULL - BETA`
+
+输出文件：
+- `res/experiments/{RUN_NAME}/ablation/ablation_addone.csv`
+- `res/experiments/{RUN_NAME}/ablation/ablation_dropone.csv`
+
+解释原则：
+- Add-one 衡量“引入价值”；Drop-one 衡量“边际贡献”；二者结合才可避免实验设计偏差。
+
+---
+
+### 5.3 Top 特征经济学解释（基于 best model 的实际结果）
+
+【待填】从 importance 输出中选取 top 特征，逐一解释：
+- 动量类：信息扩散与趋势延续  
+- 反转类：微观结构噪声与流动性提供  
+- 流动性冲击：资金冲击/事件驱动  
+- 行业状态：行业轮动与资金偏好  
+并在消融结果中核对这些解释是否一致（例如去掉 ECON 后 IC 显著下降，说明工程特征确实贡献）。
+
+---
+
+## 6. 不同数据集划分方式的影响（在确定最优架构后进行）
+
+### 6.1 切分方式定义
+
+- simple split：例如 2016-2018 train，2019 valid，2020 test  
+- forward split：滚动/扩窗训练，验证与测试窗口随时间前进，模拟真实上线迭代
+
+### 6.2 为什么 forward 更能反映 regime shift
+
+金融市场存在显著的结构变化（波动水平、行业轮动、宏观政策、流动性环境）。  
+simple split 可能偶然对某段 regime 拟合较好，但 forward split 更接近真实交易系统的“在线更新”情景，因此更能检验模型的稳健性与泛化能力。
+
+### 6.3 对比实验（以当前最优架构为基准）
+
+【待填】选定一个当前最稳的模型架构（例如 LGBM 或 CNN/TCN），在两种 split 下对比 valid/test daily IC，并讨论差异来源。
+
+---
+
+## 7. 中性化 / 缺失值处理等
+
+### 7.1 中性化的意义：从暴露到 residual alpha
+
+行业与 beta 暴露可能带来较高 IC，但其本质可能是“系统性风险溢价”而非可控 alpha。  
+通过中性化可以剥离这些暴露成分，使预测更聚焦于个股特异部分，从而提升可解释性，并减少对行业轮动的依赖。
+
+### 7.2 标签中性化 vs 预测中性化
+
+- 标签中性化（`neu_winsor_csz`）：在训练目标层面剥离暴露，模型直接学 residual alpha。  
+- 预测中性化（`pred_neutralize_by_date`）：模型先预测，再对 pred 做横截面回归残差作为最终信号。
+
+两者可对照实验以回答：
+- 哪种方式在 forward split 下更稳？  
+- 中性化是否牺牲了一部分可预测的系统性成分，从而影响 IC？
+
+### 7.3 缺失处理策略
+
+当前策略：
+- 数值特征进入模型前 `fillna(0)`（保证线性/NN 可训练）  
+- 可选地输入 missing features（cnt/isna）来区分“缺失填 0”与“真实 0”  
+- 对长期整列缺失的 r/dv 桶，优先统计后删除，避免噪声维度
+
+【下一步】对序列模型可加入 mask 通道（r_isna/dv_isna）以显式建模缺失位置。
+
+### 7.4 为什么剔除 daily-constant 时间特征（dow_/mkt_）
+
+在以 daily IC 为唯一指标的设定下，任何“同一天对所有股票相同”的特征，只会给预测加上当日常数项，而相关系数对加常数不敏感，因此对分数贡献几乎为零。  
+剔除此类特征能减少模型容量浪费与过拟合风险，并使报告更聚焦于可区分个股的信号来源（经济学特征、行业状态、缺失模式、个股固定效应等）。
+
+---
+
+## 8. 总结
+
+### 8.1 当前阶段最稳健方案（待最终确认）
+
+【待填】基于统一口径与 forward split 的实验，给出当前最稳的模型与配置（例如 LGBM 或 CNN/TCN），并说明其关键特征来源贡献（来自消融实验）。
+
+### 8.2 关键结论
+
+- 单因子 IC sanity check 用于确认信号存在性与识别无效/缺失特征列  
+- 经济学工程特征（动量/流动性冲击等）与行业状态特征（ind_*）通常是提升横截面预测的核心来源  
+- ID 与 Missing 信息属于增强项，必须通过 Add-one/Drop-one 与 forward split 严格验证其可泛化性
+
+### 8.3 下一步改进方向
+
+- 更严格的长期缺失列筛除与 mask 建模  
+- 深度模型正则与架构升级：CNN → TCN →（跨日序列后）Transformer  
+- 更丰富的跨日滞后特征（lag features）用于提高次日可预测性  
+- 在 forward split 下做超参搜索与稳健性评估（不同市场状态/行业分组）

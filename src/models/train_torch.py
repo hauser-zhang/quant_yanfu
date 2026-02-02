@@ -157,6 +157,7 @@ class SequenceHybridRegressor(_try_import_torch().nn.Module):
         rnn_hidden=64,
         rnn_layers=1,
         bidirectional=False,
+        id_emb_dim=0,
     ):
         super().__init__()
         torch = _try_import_torch()
@@ -196,7 +197,8 @@ class SequenceHybridRegressor(_try_import_torch().nn.Module):
         self.f_out = torch.nn.Linear(f_last, f_hidden_dim) if self.has_f else None
 
         # alpha head
-        alpha_in_dim = self.backbone.out_dim + (f_hidden_dim if self.has_f else 0)
+        self.id_emb_dim = int(id_emb_dim)
+        alpha_in_dim = self.backbone.out_dim + (f_hidden_dim if self.has_f else 0) + self.id_emb_dim
         alpha_hidden_dims = [alpha_hidden_dim] * max(0, int(alpha_layers))
         self.alpha = MLPRegressor(
             alpha_in_dim,
@@ -209,7 +211,7 @@ class SequenceHybridRegressor(_try_import_torch().nn.Module):
         # risk head: linear on industry/beta/indbeta
         self.risk = torch.nn.Linear(len(risk_idx), 1, bias=False) if self.has_risk else None
 
-    def forward(self, x):
+    def forward(self, x, id_emb=None):
         torch = _try_import_torch()
         r = x.index_select(1, self.r_idx)
         dv = x.index_select(1, self.dv_idx)
@@ -225,6 +227,8 @@ class SequenceHybridRegressor(_try_import_torch().nn.Module):
         else:
             alpha_in = seq_emb
 
+        if self.id_emb_dim > 0 and id_emb is not None:
+            alpha_in = torch.cat([alpha_in, id_emb], dim=1)
         alpha = self.alpha(alpha_in)
         if self.risk is not None:
             risk = self.risk(x.index_select(1, self.risk_idx))
@@ -262,6 +266,12 @@ def train_torch_model(
     valid_dates = kwargs.get("valid_dates", None)
     if valid_dates is not None:
         valid_dates = np.asarray(valid_dates)
+    use_id_embedding = bool(kwargs.get("use_id_embedding", False))
+    id_emb_dim = int(kwargs.get("id_emb_dim", 8))
+    id_dropout_p = float(kwargs.get("id_dropout_p", 0.1))
+    id_train = kwargs.get("id_train", None)
+    id_valid = kwargs.get("id_valid", None)
+    id_predict = kwargs.get("id_predict", None)
 
     Xtr = _prepare_X(X_train)
     Xva = _prepare_X(X_valid)
@@ -284,7 +294,8 @@ def train_torch_model(
         batch_norm = bool(kwargs.get("batch_norm", True))
         residual = bool(kwargs.get("residual", False))
         hidden_dims = [] if model_type == "linear" or num_layers <= 0 else [hidden_dim] * num_layers
-        model = MLPRegressor(Xtr.shape[1], hidden_dims, dropout=dropout, batch_norm=batch_norm, residual=residual)
+        in_dim = Xtr.shape[1] + (id_emb_dim if use_id_embedding and id_train is not None else 0)
+        model = MLPRegressor(in_dim, hidden_dims, dropout=dropout, batch_norm=batch_norm, residual=residual)
     else:
         if feature_names is None or len(feature_names) != Xtr.shape[1]:
             if hasattr(X_train, "columns"):
@@ -325,16 +336,24 @@ def train_torch_model(
             rnn_hidden=int(kwargs.get("rnn_hidden", 64)),
             rnn_layers=int(kwargs.get("rnn_layers", 1)),
             bidirectional=bool(kwargs.get("bidirectional", False)),
+            id_emb_dim=id_emb_dim if use_id_embedding and id_train is not None else 0,
         )
 
     model = model.to(dev)
     if debug:
         print(model)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    if use_id_embedding and id_train is not None:
+        id_vocab_size = int(max(np.max(id_train), np.max(id_valid) if id_valid is not None else 0) + 1)
+        id_embed = torch.nn.Embedding(id_vocab_size, id_emb_dim).to(dev)
+        params_all = list(model.parameters()) + list(id_embed.parameters())
+    else:
+        id_embed = None
+        params_all = list(model.parameters())
+    opt = torch.optim.Adam(params_all, lr=lr)
     scheduler = None
     if scheduler_type == "plateau_ic":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, mode="max", factor=0.8, patience=5, min_lr=1e-4
+            opt, mode="max", factor=0.8, patience=3, min_lr=1e-5
         )
     elif scheduler_type == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_epochs, eta_min=lr * 0.05)
@@ -347,12 +366,22 @@ def train_torch_model(
     n_train = Xtr.shape[0]
     n_valid = Xva.shape[0]
     pin_memory = dev.type == "cuda"
-    train_ds = torch.utils.data.TensorDataset(
-        torch.from_numpy(Xtr), torch.from_numpy(ytr), torch.from_numpy(wtr)
-    )
-    valid_ds = torch.utils.data.TensorDataset(
-        torch.from_numpy(Xva), torch.from_numpy(yva), torch.from_numpy(wva)
-    )
+    if use_id_embedding and id_train is not None:
+        train_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(Xtr),
+            torch.from_numpy(ytr),
+            torch.from_numpy(wtr),
+            torch.from_numpy(np.asarray(id_train, dtype=np.int64)),
+        )
+        valid_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(Xva),
+            torch.from_numpy(yva),
+            torch.from_numpy(wva),
+            torch.from_numpy(np.asarray(id_valid, dtype=np.int64)),
+        )
+    else:
+        train_ds = torch.utils.data.TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(ytr), torch.from_numpy(wtr))
+        valid_ds = torch.utils.data.TensorDataset(torch.from_numpy(Xva), torch.from_numpy(yva), torch.from_numpy(wva))
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
     )
@@ -379,11 +408,24 @@ def train_torch_model(
                 ncols=100,
                 leave=False,
             )
-        for xb, yb, wb in train_iter:
+        for batch in train_iter:
+            if use_id_embedding and id_embed is not None:
+                xb, yb, wb, ib = batch
+            else:
+                xb, yb, wb = batch
+                ib = None
             xb = xb.to(dev)
             yb = yb.view(-1, 1).to(dev)
             wb = wb.view(-1, 1).to(dev)
-            pred = model(xb)
+            if ib is not None:
+                ib = ib.to(dev)
+                if id_dropout_p > 0:
+                    drop_mask = torch.rand_like(ib.float()) < id_dropout_p
+                    ib = torch.where(drop_mask, torch.zeros_like(ib), ib)
+                e = id_embed(ib)
+                pred = model(xb, e) if model_type in {"cnn", "rnn", "lstm", "gru"} else model(torch.cat([xb, e], dim=1))
+            else:
+                pred = model(xb)
             loss = _weighted_mse(pred, yb, wb)
             opt.zero_grad()
             loss.backward()
@@ -399,11 +441,21 @@ def train_torch_model(
             preds_v = []
             yv_all = []
             wv_all = []
-            for xv, yv, wv in valid_loader:
+            for batch in valid_loader:
+                if use_id_embedding and id_embed is not None:
+                    xv, yv, wv, iv = batch
+                else:
+                    xv, yv, wv = batch
+                    iv = None
                 xv = xv.to(dev)
                 yv = yv.view(-1, 1).to(dev)
                 wv = wv.view(-1, 1).to(dev)
-                pv = model(xv)
+                if iv is not None:
+                    iv = iv.to(dev)
+                    e = id_embed(iv)
+                    pv = model(xv, e) if model_type in {"cnn", "rnn", "lstm", "gru"} else model(torch.cat([xv, e], dim=1))
+                else:
+                    pv = model(xv)
                 vloss_sum += float(_weighted_mse(pv, yv, wv).item()) * len(xv)
                 vcount += len(xv)
                 preds_v.append(pv.view(-1).cpu().numpy())
@@ -431,9 +483,20 @@ def train_torch_model(
                 ys = []
                 ws = []
                 with torch.no_grad():
-                    for xb, yb, wb in loader:
+                    for batch in loader:
+                        if use_id_embedding and id_embed is not None:
+                            xb, yb, wb, ib = batch
+                        else:
+                            xb, yb, wb = batch
+                            ib = None
                         xb = xb.to(dev)
-                        pv = model(xb).view(-1).detach().cpu().numpy()
+                        if ib is not None:
+                            ib = ib.to(dev)
+                            e = id_embed(ib)
+                            pv_t = model(xb, e) if model_type in {"cnn", "rnn", "lstm", "gru"} else model(torch.cat([xb, e], dim=1))
+                        else:
+                            pv_t = model(xb)
+                        pv = pv_t.view(-1).detach().cpu().numpy()
                         preds.append(pv)
                         ys.append(yb.view(-1).cpu().numpy())
                         ws.append(wb.view(-1).cpu().numpy())
@@ -516,10 +579,20 @@ def train_torch_model(
             writer.writeheader()
             writer.writerows(history)
 
-    def predict_fn(Xnew):
+    def predict_fn(Xnew, id_new=None):
         model.eval()
         with torch.no_grad():
             xn = torch.from_numpy(_prepare_X(Xnew)).to(dev)
+            if use_id_embedding and id_embed is not None:
+                ids_src = id_new if id_new is not None else id_predict
+                if ids_src is None or len(ids_src) != len(Xnew):
+                    ids = np.zeros(len(Xnew), dtype=np.int64)
+                else:
+                    ids = np.asarray(ids_src, dtype=np.int64)
+                it = torch.from_numpy(ids).to(dev)
+                emb = id_embed(it)
+                pred = model(xn, emb) if model_type in {"cnn", "rnn", "lstm", "gru"} else model(torch.cat([xn, emb], dim=1))
+                return pred.view(-1).cpu().numpy()
             return model(xn).view(-1).cpu().numpy()
 
     return model, predict_fn

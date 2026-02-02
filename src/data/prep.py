@@ -100,17 +100,36 @@ class EncoderState:
     feature_cols: List[str]
 
 
-def _get_feature_cols(df: pd.DataFrame) -> List[str]:
-    """Infer feature columns by excluding meta/target/label columns."""
+def _get_feature_cols(
+    df: pd.DataFrame,
+    include_missing_features: bool = False,
+    include_time_constant_features: bool = False,
+    drop_redundant_features: bool = True,
+) -> List[str]:
+    """Infer feature columns by excluding meta and configured feature families."""
     exclude = {"id", "y", "y_raw", "y_label", "y_score", "weight", "DateTime", "date"}
-    # Drop missing-count features from model input by default
-    exclude_missing = {"r_missing_cnt", "dv_missing_cnt"}
-    # Drop missing-indicator features (model shouldn't learn missingness directly)
-    exclude_missing_indicators = {"beta_isna", "indbeta_isna", "any_f_missing", "industry_isna"}
+    exclude_missing = set()
+    if not include_missing_features:
+        exclude_missing = {
+            "r_missing_cnt",
+            "dv_missing_cnt",
+            "beta_isna",
+            "indbeta_isna",
+            "any_f_missing",
+            "industry_isna",
+        }
+    exclude_time_constant = set()
+    if not include_time_constant_features:
+        exclude_time_constant = {c for c in df.columns if c.startswith(("dow_", "mon_", "mkt_"))}
+    exclude_redundant = {"ret_last", "rev_30m"} if drop_redundant_features else set()
+
     return [
         c
         for c in df.columns
-        if c not in exclude and c not in exclude_missing and c not in exclude_missing_indicators
+        if c not in exclude
+        and c not in exclude_missing
+        and c not in exclude_time_constant
+        and c not in exclude_redundant
     ]
 
 
@@ -363,7 +382,11 @@ def label_transform_by_date(
 
 
 def fit_transform_train(
-    df_train: pd.DataFrame, label_col: str = "y"
+    df_train: pd.DataFrame,
+    label_col: str = "y",
+    include_missing_features: bool = False,
+    include_time_constant_features: bool = False,
+    drop_redundant_features: bool = True,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[str], EncoderState]:
     """Fit encoders on train set and return X/y/w."""
     df = df_train.copy()
@@ -371,7 +394,12 @@ def fit_transform_train(
     df = df.loc[:, ~df.columns.duplicated()]
     df = df[df[label_col].notna()]
 
-    feature_cols = _get_feature_cols(df)
+    feature_cols = _get_feature_cols(
+        df,
+        include_missing_features=include_missing_features,
+        include_time_constant_features=include_time_constant_features,
+        drop_redundant_features=drop_redundant_features,
+    )
     df_feat = df[feature_cols + [label_col, "weight"]].copy()
 
     df_feat, industry_cols = _encode_industry(df_feat)
@@ -386,7 +414,12 @@ def fit_transform_train(
 
 
 def transform_eval(
-    df_eval: pd.DataFrame, state: EncoderState, label_col: str = "y"
+    df_eval: pd.DataFrame,
+    state: EncoderState,
+    label_col: str = "y",
+    include_missing_features: bool = False,
+    include_time_constant_features: bool = False,
+    drop_redundant_features: bool = True,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """Transform eval set using saved encoder state."""
     df = df_eval.copy()
@@ -394,7 +427,12 @@ def transform_eval(
     df = df.loc[:, ~df.columns.duplicated()]
     df = df[df[label_col].notna()]
 
-    feature_cols = _get_feature_cols(df)
+    feature_cols = _get_feature_cols(
+        df,
+        include_missing_features=include_missing_features,
+        include_time_constant_features=include_time_constant_features,
+        drop_redundant_features=drop_redundant_features,
+    )
     df_feat = df[feature_cols + [label_col, "weight"]].copy()
     df_feat, _ = _encode_industry(df_feat, industry_cols=state.industry_cols)
 

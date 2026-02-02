@@ -1,0 +1,143 @@
+{
+  "torch_mlp": {
+    "num_layers": [
+      2
+    ],
+    "hidden_dim": [
+      128
+    ],
+    "dropout": [
+      0.1
+    ],
+    "batch_norm": [
+      true
+    ],
+    "residual": [
+      true
+    ],
+    "batch_size": [
+      512
+    ],
+    "num_workers": [
+      16
+    ],
+    "max_epochs": [
+      300
+    ],
+    "log_every": [
+      3
+    ],
+    "lr": [
+      0.003
+    ],
+    "early_stop_patience": [
+      50
+    ],
+    "early_stop_min_delta": [
+      0.0
+    ],
+    "scheduler_type": [
+      "plateau_ic"
+    ]
+  },
+  "torch_cnn": {
+    "cnn_channels": [
+      128
+    ],
+    "kernel_size": [
+      3
+    ],
+    "dropout": [
+      0.1
+    ],
+    "alpha_layers": [
+      2
+    ],
+    "alpha_hidden_dim": [
+      128
+    ],
+    "f_layers": [
+      2
+    ],
+    "f_hidden_dim": [
+      128
+    ],
+    "batch_size": [
+      512
+    ],
+    "num_workers": [
+      16
+    ],
+    "max_epochs": [
+      300
+    ],
+    "log_every": [
+      3
+    ],
+    "lr": [
+      0.003
+    ],
+    "early_stop_patience": [
+      50
+    ],
+    "early_stop_min_delta": [
+      0.0
+    ],
+    "scheduler_type": [
+      "plateau_ic"
+    ],
+    "residual": [
+      true
+    ]
+  },
+  "torch_lstm": {
+    "rnn_hidden": [
+      128
+    ],
+    "rnn_layers": [
+      2
+    ],
+    "dropout": [
+      0.1
+    ],
+    "alpha_layers": [
+      2
+    ],
+    "alpha_hidden_dim": [
+      128
+    ],
+    "f_layers": [
+      2
+    ],
+    "f_hidden_dim": [
+      128
+    ],
+    "batch_size": [
+      128
+    ],
+    "num_workers": [
+      16
+    ],
+    "max_epochs": [
+      300
+    ],
+    "log_every": [
+      3
+    ],
+    "lr": [
+      0.003
+    ],
+    "early_stop_patience": [
+      50
+    ],
+    "early_stop_min_delta": [
+      0.0
+    ],
+    "scheduler_type": [
+      "plateau_ic"
+    ],
+    "residual": [
+      true
+    ]
+  }
+}
