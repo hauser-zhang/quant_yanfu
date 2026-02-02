@@ -161,10 +161,12 @@ class SequenceHybridRegressor(_try_import_torch().nn.Module):
         super().__init__()
         torch = _try_import_torch()
 
-        self.r_idx = r_idx
-        self.dv_idx = dv_idx
-        self.f_idx = f_idx
-        self.risk_idx = risk_idx
+        self.register_buffer("r_idx", torch.tensor(r_idx, dtype=torch.long), persistent=False)
+        self.register_buffer("dv_idx", torch.tensor(dv_idx, dtype=torch.long), persistent=False)
+        self.register_buffer("f_idx", torch.tensor(f_idx, dtype=torch.long), persistent=False)
+        self.register_buffer("risk_idx", torch.tensor(risk_idx, dtype=torch.long), persistent=False)
+        self.has_f = len(f_idx) > 0
+        self.has_risk = len(risk_idx) > 0
 
         if backbone_type == "cnn":
             self.backbone = CNNBackbone(
@@ -190,11 +192,11 @@ class SequenceHybridRegressor(_try_import_torch().nn.Module):
 
         # f branch
         f_hidden_dims = [f_hidden_dim] * max(0, int(f_layers))
-        self.f_blocks, f_last = _mlp_blocks(len(f_idx), f_hidden_dims, dropout, batch_norm) if f_idx else (None, 0)
-        self.f_out = torch.nn.Linear(f_last, f_hidden_dim) if f_idx else None
+        self.f_blocks, f_last = _mlp_blocks(len(f_idx), f_hidden_dims, dropout, batch_norm) if self.has_f else (None, 0)
+        self.f_out = torch.nn.Linear(f_last, f_hidden_dim) if self.has_f else None
 
         # alpha head
-        alpha_in_dim = self.backbone.out_dim + (f_hidden_dim if f_idx else 0)
+        alpha_in_dim = self.backbone.out_dim + (f_hidden_dim if self.has_f else 0)
         alpha_hidden_dims = [alpha_hidden_dim] * max(0, int(alpha_layers))
         self.alpha = MLPRegressor(
             alpha_in_dim,
@@ -205,17 +207,17 @@ class SequenceHybridRegressor(_try_import_torch().nn.Module):
         )
 
         # risk head: linear on industry/beta/indbeta
-        self.risk = torch.nn.Linear(len(risk_idx), 1, bias=False) if risk_idx else None
+        self.risk = torch.nn.Linear(len(risk_idx), 1, bias=False) if self.has_risk else None
 
     def forward(self, x):
         torch = _try_import_torch()
-        r = x[:, self.r_idx]
-        dv = x[:, self.dv_idx]
+        r = x.index_select(1, self.r_idx)
+        dv = x.index_select(1, self.dv_idx)
         seq = torch.stack([r, dv], dim=-1)  # (B, T, 2)
         seq_emb = self.backbone(seq)
 
-        if self.f_idx:
-            f = x[:, self.f_idx]
+        if self.has_f:
+            f = x.index_select(1, self.f_idx)
             for block in self.f_blocks:
                 f = block(f)
             f = self.f_out(f)
@@ -225,7 +227,7 @@ class SequenceHybridRegressor(_try_import_torch().nn.Module):
 
         alpha = self.alpha(alpha_in)
         if self.risk is not None:
-            risk = self.risk(x[:, self.risk_idx])
+            risk = self.risk(x.index_select(1, self.risk_idx))
             return alpha + risk
         return alpha
 
@@ -284,6 +286,9 @@ def train_torch_model(
         hidden_dims = [] if model_type == "linear" or num_layers <= 0 else [hidden_dim] * num_layers
         model = MLPRegressor(Xtr.shape[1], hidden_dims, dropout=dropout, batch_norm=batch_norm, residual=residual)
     else:
+        if feature_names is None or len(feature_names) != Xtr.shape[1]:
+            if hasattr(X_train, "columns"):
+                feature_names = list(X_train.columns)
         if not feature_names:
             raise ValueError("feature_names must be provided for sequence models")
         r_cols = [f"r_{i}" for i in range(20) if f"r_{i}" in feature_names]
@@ -295,6 +300,12 @@ def train_torch_model(
         f_idx = [feature_names.index(c) for c in feature_names if c.startswith("f_")]
         risk_cols = [c for c in feature_names if c.startswith("industry_")] + [c for c in ["beta", "indbeta"] if c in feature_names]
         risk_idx = [feature_names.index(c) for c in risk_cols]
+        max_idx = max(r_idx + dv_idx + f_idx + risk_idx)
+        if max_idx >= Xtr.shape[1]:
+            raise ValueError(
+                f"Sequence index out of bounds: max_idx={max_idx}, X_dim={Xtr.shape[1]}. "
+                "Check feature_names vs X columns."
+            )
 
         model = SequenceHybridRegressor(
             r_idx=r_idx,
@@ -323,7 +334,7 @@ def train_torch_model(
     scheduler = None
     if scheduler_type == "plateau_ic":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, mode="max", factor=0.5, patience=2, min_lr=1e-6
+            opt, mode="max", factor=0.8, patience=5, min_lr=1e-4
         )
     elif scheduler_type == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_epochs, eta_min=lr * 0.05)

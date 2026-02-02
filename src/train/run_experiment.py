@@ -1288,6 +1288,8 @@ def main() -> None:
     print("[Step6] Feature ablation start")
     # Feature ablation
     groups = _get_feature_groups(best_entry["feature_names"])
+    seq_model = best in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}
+    seq_required = {f"r_{i}" for i in range(20)} | {f"dv_{i}" for i in range(20)}
     if args.debug:
         print("[DEBUG] Feature groups sizes:", {k: len(v) for k, v in groups.items()})
         print("[DEBUG] Feature groups names:", groups)
@@ -1297,6 +1299,10 @@ def main() -> None:
     ablation_rows.append({"setting": "full", "valid_score": full_score, "is_full": True})
     for gname, gcols in groups.items():
         if not gcols:
+            continue
+        if seq_model and not seq_required.issubset(set(gcols)):
+            if args.debug:
+                print(f"[DEBUG] Skip group-only {gname} for seq model (missing r/dv).")
             continue
         Xtr_g = best_entry["X_train"][gcols]
         Xva_g = best_entry["X_valid"][gcols]
@@ -1329,6 +1335,10 @@ def main() -> None:
         if not gcols:
             continue
         keep_cols = [c for c in best_entry["feature_names"] if c not in gcols]
+        if seq_model and not seq_required.issubset(set(keep_cols)):
+            if args.debug:
+                print(f"[DEBUG] Skip drop-one {gname} for seq model (missing r/dv).")
+            continue
         Xtr_g = best_entry["X_train"][keep_cols]
         Xva_g = best_entry["X_valid"][keep_cols]
         model_g, pred_fn_g = _train_model(
