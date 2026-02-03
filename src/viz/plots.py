@@ -97,3 +97,36 @@ def plot_feature_importance(fi_df: pd.DataFrame, out_path: Path, top_n: int = 30
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_torch_training_history(history_df: pd.DataFrame, out_path: Path, title: str | None = None) -> None:
+    """Plot torch training history (loss and IC curves)."""
+    if history_df.empty or "epoch" not in history_df.columns:
+        return
+    df = history_df.copy().sort_values("epoch")
+    fig, axes = plt.subplots(2, 1, figsize=(11, 7), dpi=220, sharex=True)
+
+    # Loss panel
+    if "train_loss" in df.columns:
+        axes[0].plot(df["epoch"], df["train_loss"], label="train_loss", color="#7C8F7A", linewidth=1.6)
+    if "valid_loss" in df.columns:
+        axes[0].plot(df["epoch"], df["valid_loss"], label="valid_loss", color="#C18F7A", linewidth=1.6)
+    axes[0].set_ylabel("Loss")
+    axes[0].legend(frameon=False)
+    _apply_clean_style(axes[0])
+
+    # IC panel
+    if "train_corr" in df.columns:
+        axes[1].plot(df["epoch"], df["train_corr"], label="train_ic", color="#6C88A2", linewidth=1.6)
+    if "valid_ic" in df.columns:
+        axes[1].plot(df["epoch"], df["valid_ic"], label="valid_ic", color="#A67C92", linewidth=1.6)
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("IC")
+    axes[1].legend(frameon=False)
+    _apply_clean_style(axes[1])
+
+    if title:
+        fig.suptitle(title, y=0.98)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)

@@ -28,11 +28,18 @@ from src.eda.data_profile import run_data_profile
 from src.features.id_encoding import fit_transform_id_te, transform_id_te
 from src.utils.exp_io import make_run_dirs, save_config, save_table
 from src.analysis.ablation import build_ablation_variants, filter_variant_columns, make_ablation_tables
+from src.split.forward_folds import generate_forward_folds
 from src.models.registry import MODEL_SPECS
 from src.models.train_sklearn import train_ridge, train_elasticnet, train_rf, train_extra_trees
 from src.models.train_lgbm import train_lgbm
 from src.models.train_torch import train_torch_model
-from src.viz.plots import plot_model_comparison, plot_daily_ic, plot_ablation, plot_feature_importance
+from src.viz.plots import (
+    plot_model_comparison,
+    plot_daily_ic,
+    plot_ablation,
+    plot_feature_importance,
+    plot_torch_training_history,
+)
 
 
 def _get_splits(split_mode: str) -> List[Dict[str, Tuple[str, str]]]:
@@ -79,6 +86,17 @@ def _train_model(
     params: dict | None = None,
 ):
     """Train a model and return (model, predict_fn)."""
+    if model_name.startswith("torch_"):
+        def _assert_finite_df(X, name: str):
+            if hasattr(X, "fillna"):
+                xf = X.fillna(0).to_numpy(dtype=np.float32)
+                if np.isfinite(xf).all():
+                    return
+                bad = [c for c in X.columns if not np.isfinite(X[c].fillna(0).to_numpy(dtype=np.float32)).all()]
+                raise ValueError(f"Non-finite values in {name} after fillna(0): {bad[:20]}")
+        _assert_finite_df(X_train, "X_train")
+        _assert_finite_df(X_valid, "X_valid")
+
     params = params or {}
     if model_name in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"} and "feature_names" not in params:
         if hasattr(X_train, "columns"):
@@ -413,6 +431,75 @@ def _dump_debug_snapshots(
     (out_dir / "x_stats_valid.json").write_text(json.dumps(_stats(df_valid, key_cols), indent=2))
 
 
+def _sample_debug_rows_by_date(df: pd.DataFrame, date_col: str = "date", n_per_date: int = 20) -> pd.DataFrame:
+    """Sample earliest+latest date rows for lightweight preprocessing inspection."""
+    if df.empty or date_col not in df.columns:
+        return df.head(0).copy()
+    dates = sorted(df[date_col].dropna().unique().tolist())
+    if not dates:
+        return df.head(0).copy()
+    pick = [dates[0]]
+    if len(dates) > 1:
+        pick.append(dates[-1])
+    parts = []
+    for d in pick:
+        g = df[df[date_col] == d]
+        parts.append(g.head(n_per_date))
+    return pd.concat(parts, ignore_index=True) if parts else df.head(0).copy()
+
+
+def _save_preprocess_snapshot(df: pd.DataFrame, out_path: Path, n_per_date: int = 20) -> None:
+    """Save compact stage snapshot for debug_preprocess."""
+    snap = _sample_debug_rows_by_date(df, n_per_date=n_per_date)
+    keep_cols = [
+        c
+        for c in [
+            "id",
+            "date",
+            "weight",
+            "y_raw",
+            "y",
+            "r_0",
+            "dv_0",
+            "beta",
+            "f_0",
+            "ind_r_mean",
+            "ind_dv_mean",
+        ]
+        if c in snap.columns
+    ]
+    extra = [c for c in snap.columns if c.startswith(("ind_", "mkt_", "dow_", "mon_"))][:20]
+    cols = keep_cols + [c for c in extra if c not in keep_cols]
+    if not cols:
+        cols = list(snap.columns[:40])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    snap[cols].to_csv(out_path, index=False)
+
+
+def _save_zscore_sanity(df: pd.DataFrame, out_path: Path, date_col: str = "date") -> None:
+    """Save per-date sanity stats after zscore for key columns."""
+    key_cols = [c for c in ["r_0", "dv_0", "beta", "f_0"] if c in df.columns]
+    ind_cols = [c for c in df.columns if c.startswith("ind_")]
+    if ind_cols:
+        key_cols.append(ind_cols[0])
+    rows = []
+    for d, g in df.groupby(date_col):
+        for c in key_cols:
+            x = g[c].dropna()
+            rows.append(
+                {
+                    "date": d,
+                    "feature": c,
+                    "mean": float(x.mean()) if len(x) else np.nan,
+                    "std": float(x.std()) if len(x) else np.nan,
+                    "min": float(x.min()) if len(x) else np.nan,
+                    "max": float(x.max()) if len(x) else np.nan,
+                    "non_nan_count": int(len(x)),
+                }
+            )
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+
+
 def _sample_days_by_year(paths: List[Path], max_days_per_year: int, seed: int) -> List[Path]:
     """Sample a fixed number of days per year for quick demos."""
     by_year: Dict[str, List[Path]] = {}
@@ -614,6 +701,14 @@ def main() -> None:
     parser.add_argument("--data_root", type=str, default="data/project_5year", help="Root path of daily data folders.")
     parser.add_argument("--run_name", type=str, required=True, help="Experiment name for res/experiments/{run_name}.")
     parser.add_argument("--split_mode", type=str, default="simple", help="Data split: simple or forward.")
+    parser.add_argument("--feature_set", type=str, default="raw_only", help="Feature scope: raw_only|raw_plus_econ|all_extended.")
+    parser.add_argument("--forward_start_date", type=str, default="2016-01-01", help="Forward split start date.")
+    parser.add_argument("--forward_end_date", type=str, default="2020-12-31", help="Forward split end date.")
+    parser.add_argument("--forward_step_months", type=int, default=6, help="Forward fold step size in months.")
+    parser.add_argument("--forward_val_months", type=int, default=6, help="Forward validation window in months.")
+    parser.add_argument("--forward_test_months", type=int, default=6, help="Forward test window in months.")
+    parser.add_argument("--forward_train_months", type=int, default=36, help="Forward train window in months.")
+    parser.add_argument("--forward_mode", type=str, default="rolling", help="Forward mode: rolling|expanding.")
     parser.add_argument("--models", type=str, default=None, help="Comma-separated model list (e.g. lgbm,rf,torch_mlp).")
     parser.add_argument("--gpu_id", type=int, default=2, help="GPU id for torch models (None for CPU).")
     parser.add_argument("--sample_days_per_year", type=int, default=0, help="Sample N days per year for quick demo (0=full).")
@@ -700,6 +795,8 @@ def main() -> None:
     )
     parser.add_argument("--x_winsorize_by_date", action="store_true", help="Feature winsorization by date (X only).")
     parser.add_argument("--x_zscore_by_date", action="store_true", help="Feature z-score by date (X only).")
+    parser.add_argument("--zscore_f_features", action=argparse.BooleanOptionalAction, default=False, help="Whether to zscore f_* features by date.")
+    parser.add_argument("--debug_preprocess", action=argparse.BooleanOptionalAction, default=False, help="Save stage-by-stage preprocessing debug artifacts.")
     parser.add_argument("--data_workers", type=int, default=4, help="Parallel workers for daily data loading.")
     parser.add_argument("--preprocess_workers", type=int, default=0, help="Parallel workers for preprocessing (0=use data_workers).")
     parser.add_argument("--q_low", type=float, default=0.01, help="Winsor lower quantile.")
@@ -722,12 +819,32 @@ def main() -> None:
     parser.add_argument("--debug_n_rows", type=int, default=2000, help="Rows to dump in debug snapshots.")
     parser.add_argument("--debug_n_features", type=int, default=60, help="Number of features to include in debug snapshots.")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging and checks.")
+    parser.add_argument(
+        "--resume_completed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse per-model fold results if they already exist under tuning/.",
+    )
+    parser.add_argument("--optim", type=str, default="adamw", help="Torch optimizer: adamw|adam.")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Torch learning rate default.")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Torch weight decay default.")
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Torch grad clip norm (0 disables).")
+    parser.add_argument("--best_metric", type=str, default="ic", help="Best-checkpoint metric for torch: ic|loss.")
+    parser.add_argument("--early_stop_metric", type=str, default="ic", help="Early-stop metric for torch: ic|loss.")
+    parser.add_argument("--early_stop_patience", type=int, default=6, help="Torch early stop patience.")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.0, help="Min improvement for early stop and best checkpoint.")
+    parser.add_argument("--scheduler_type", type=str, default="plateau_ic", help="Torch LR scheduler: none|plateau_ic|cosine.")
+    parser.add_argument("--plateau_factor", type=float, default=0.8, help="ReduceLROnPlateau factor.")
+    parser.add_argument("--plateau_patience", type=int, default=8, help="ReduceLROnPlateau patience.")
+    parser.add_argument("--plateau_min_lr", type=float, default=1e-5, help="ReduceLROnPlateau min lr.")
     args = parser.parse_args()
     if args.label_mode not in {"raw", "winsor_csz", "neu_winsor_csz"}:
         raise ValueError("label_mode must be one of: raw | winsor_csz | neu_winsor_csz")
+    if args.feature_set not in {"raw_only", "raw_plus_econ", "all_extended"}:
+        raise ValueError("feature_set must be one of: raw_only | raw_plus_econ | all_extended")
 
     run_dir = Path("res/experiments") / args.run_name
-    dirs = make_run_dirs(run_dir, enable_debug=args.debug or args.dump_debug_snapshots)
+    dirs = make_run_dirs(run_dir, enable_debug=args.debug or args.dump_debug_snapshots or args.debug_preprocess)
     (run_dir / "predictions").mkdir(exist_ok=True)
     (run_dir / "plots").mkdir(exist_ok=True)  # backward compatibility
     (run_dir / "ic_series").mkdir(exist_ok=True)
@@ -742,6 +859,14 @@ def main() -> None:
     config = {
         "run_name": args.run_name,
         "split_mode": args.split_mode,
+        "feature_set": args.feature_set,
+        "forward_start_date": args.forward_start_date,
+        "forward_end_date": args.forward_end_date,
+        "forward_step_months": args.forward_step_months,
+        "forward_val_months": args.forward_val_months,
+        "forward_test_months": args.forward_test_months,
+        "forward_train_months": args.forward_train_months,
+        "forward_mode": args.forward_mode,
         "models": args.models,
         "use_feat": args.use_feat,
         "data_root": args.data_root,
@@ -771,6 +896,8 @@ def main() -> None:
         "add_industry_state_features": args.add_industry_state_features,
         "x_winsorize_by_date": args.x_winsorize_by_date,
         "x_zscore_by_date": args.x_zscore_by_date,
+        "zscore_f_features": args.zscore_f_features,
+        "debug_preprocess": args.debug_preprocess,
         "data_workers": args.data_workers,
         "preprocess_workers": args.preprocess_workers,
         "q_low": args.q_low,
@@ -785,6 +912,19 @@ def main() -> None:
         "debug_n_rows": args.debug_n_rows,
         "debug_n_features": args.debug_n_features,
         "debug": args.debug,
+        "resume_completed": args.resume_completed,
+        "optim": args.optim,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "grad_clip_norm": args.grad_clip_norm,
+        "best_metric": args.best_metric,
+        "early_stop_metric": args.early_stop_metric,
+        "early_stop_patience": args.early_stop_patience,
+        "early_stop_min_delta": args.early_stop_min_delta,
+        "scheduler_type": args.scheduler_type,
+        "plateau_factor": args.plateau_factor,
+        "plateau_patience": args.plateau_patience,
+        "plateau_min_lr": args.plateau_min_lr,
     }
     save_config(run_dir, config)
 
@@ -795,7 +935,20 @@ def main() -> None:
 
     metrics_rows = []
     pred_cache = {}
-    splits = _get_splits(args.split_mode)
+    if args.split_mode == "forward":
+        splits = generate_forward_folds(
+            start_date=args.forward_start_date,
+            end_date=args.forward_end_date,
+            train_months=args.forward_train_months,
+            val_months=args.forward_val_months,
+            test_months=args.forward_test_months,
+            step_months=args.forward_step_months,
+            mode=args.forward_mode,
+        )
+        if not splits:
+            raise ValueError("No forward folds generated; check forward_* date/window settings.")
+    else:
+        splits = _get_splits(args.split_mode)
     config["splits"] = splits
     save_config(run_dir, config)
 
@@ -841,6 +994,12 @@ def main() -> None:
             df_train = _apply_dv_log1p(df_train)
             df_valid = _apply_dv_log1p(df_valid)
             df_test = _apply_dv_log1p(df_test)
+            if args.debug_preprocess:
+                _save_preprocess_snapshot(
+                    df_train,
+                    run_dir / "debug" / "x_snapshot_after_log1p.csv",
+                    n_per_date=20,
+                )
 
         # Optional time/state features
         if args.add_time_features:
@@ -873,7 +1032,11 @@ def main() -> None:
             and pd.api.types.is_numeric_dtype(df_train[c])
             and not pd.api.types.is_bool_dtype(df_train[c])
         ]
-        zscore_exclude_prefixes = ("dow_", "mon_", "mkt_", "ind_")
+        # ind_* varies across stocks within day and should be standardized.
+        # f_* is already normalized/slow-moving; exclude from per-date zscore by default.
+        zscore_exclude_prefixes = ("dow_", "mon_", "mkt_")
+        if not args.zscore_f_features:
+            zscore_exclude_prefixes = zscore_exclude_prefixes + ("f_",)
         zscore_cols = [c for c in num_cols if not c.startswith(zscore_exclude_prefixes)]
         pp_workers = args.preprocess_workers or args.data_workers
         if args.x_winsorize_by_date:
@@ -907,6 +1070,12 @@ def main() -> None:
                 desc="Winsorize X test",
                 n_workers=pp_workers,
             )
+            if args.debug_preprocess:
+                _save_preprocess_snapshot(
+                    df_train,
+                    run_dir / "debug" / "x_snapshot_after_winsor.csv",
+                    n_per_date=20,
+                )
         if args.x_zscore_by_date:
             df_train = zscore_by_date(
                 df_train, zscore_cols, args.min_n, show_progress=True, desc="Z-score X train", n_workers=pp_workers
@@ -917,6 +1086,13 @@ def main() -> None:
             df_test = zscore_by_date(
                 df_test, zscore_cols, args.min_n, show_progress=True, desc="Z-score X test", n_workers=pp_workers
             )
+            if args.debug_preprocess:
+                _save_preprocess_snapshot(
+                    df_train,
+                    run_dir / "debug" / "x_snapshot_after_zscore.csv",
+                    n_per_date=20,
+                )
+                _save_zscore_sanity(df_train, run_dir / "debug" / "zscore_sanity_by_date.csv", date_col="date")
         print(f"[Step2] Feature preprocessing done (fold {fold_idx})")
 
         print(f"[Step2b] Label transform: {args.label_mode} (fold {fold_idx})")
@@ -1038,6 +1214,8 @@ def main() -> None:
             include_missing_features=args.include_missing_features,
             include_time_constant_features=args.include_time_constant_features,
             drop_redundant_features=args.drop_redundant_features,
+            feature_set=args.feature_set,
+            use_id_encoding=args.use_id_encoding,
         )
         X_valid, y_valid, w_valid = transform_eval(
             df_valid_main,
@@ -1046,6 +1224,8 @@ def main() -> None:
             include_missing_features=args.include_missing_features,
             include_time_constant_features=args.include_time_constant_features,
             drop_redundant_features=args.drop_redundant_features,
+            feature_set=args.feature_set,
+            use_id_encoding=args.use_id_encoding,
         )
         X_test, y_test, w_test = transform_eval(
             df_test_main,
@@ -1054,9 +1234,12 @@ def main() -> None:
             include_missing_features=args.include_missing_features,
             include_time_constant_features=args.include_time_constant_features,
             drop_redundant_features=args.drop_redundant_features,
+            feature_set=args.feature_set,
+            use_id_encoding=args.use_id_encoding,
         )
         feature_groups = _get_feature_groups(feature_names)
         (dirs["tables"] / "feature_cols_used.txt").write_text("\n".join(feature_names) + "\n")
+        pd.DataFrame({"feature": feature_names}).to_csv(dirs["tables"] / "feature_cols_used.csv", index=False)
 
         # Dump torch first batch if requested
         if args.dump_debug_snapshots and any(m.startswith("torch_") for m in model_list):
@@ -1147,6 +1330,15 @@ def main() -> None:
 
         def _run_one(mname: str):
             print(f"[Step4] Start model: {mname} (fold {fold_idx})")
+            result_json = run_dir / "tuning" / f"{mname}_fold{fold_idx}_result.json"
+            if args.resume_completed and result_json.exists():
+                try:
+                    cached = json.loads(result_json.read_text())
+                    print(f"[Step4] Reuse cached model result: {mname} (fold {fold_idx})")
+                    return cached
+                except Exception:
+                    if args.debug:
+                        print(f"[DEBUG] Failed to load cached result for {mname} fold={fold_idx}, retrain.")
             Xtr_use, Xva_use, Xte_use = X_train, X_valid, X_test
             if mname in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}:
                 raw_cols = feature_groups.get("G_raw_all", [])
@@ -1181,6 +1373,18 @@ def main() -> None:
                     train_params["id_dropout_p"] = args.id_dropout_p
                     train_params["id_train"] = id_train_idx
                     train_params["id_valid"] = id_valid_idx
+                    train_params.setdefault("optim", args.optim)
+                    train_params.setdefault("lr", args.lr)
+                    train_params.setdefault("weight_decay", args.weight_decay)
+                    train_params.setdefault("grad_clip_norm", args.grad_clip_norm)
+                    train_params.setdefault("best_metric", args.best_metric)
+                    train_params.setdefault("early_stop_metric", args.early_stop_metric)
+                    train_params.setdefault("early_stop_patience", args.early_stop_patience)
+                    train_params.setdefault("early_stop_min_delta", args.early_stop_min_delta)
+                    train_params.setdefault("scheduler_type", args.scheduler_type)
+                    train_params.setdefault("plateau_factor", args.plateau_factor)
+                    train_params.setdefault("plateau_patience", args.plateau_patience)
+                    train_params.setdefault("plateau_min_lr", args.plateau_min_lr)
                 if mname in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}:
                     train_params["feature_names"] = list(Xtr_use.columns)
                 if mname.startswith("torch_"):
@@ -1233,6 +1437,18 @@ def main() -> None:
                     train_params["id_dropout_p"] = args.id_dropout_p
                     train_params["id_train"] = id_train_idx
                     train_params["id_valid"] = id_valid_idx
+                    train_params.setdefault("optim", args.optim)
+                    train_params.setdefault("lr", args.lr)
+                    train_params.setdefault("weight_decay", args.weight_decay)
+                    train_params.setdefault("grad_clip_norm", args.grad_clip_norm)
+                    train_params.setdefault("best_metric", args.best_metric)
+                    train_params.setdefault("early_stop_metric", args.early_stop_metric)
+                    train_params.setdefault("early_stop_patience", args.early_stop_patience)
+                    train_params.setdefault("early_stop_min_delta", args.early_stop_min_delta)
+                    train_params.setdefault("scheduler_type", args.scheduler_type)
+                    train_params.setdefault("plateau_factor", args.plateau_factor)
+                    train_params.setdefault("plateau_patience", args.plateau_patience)
+                    train_params.setdefault("plateau_min_lr", args.plateau_min_lr)
                 if mname in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}:
                     train_params["feature_names"] = list(Xtr_use.columns)
                 if mname.startswith("torch_"):
@@ -1273,6 +1489,10 @@ def main() -> None:
                     tune_df = pd.DataFrame([{**best_params, "valid_score": res["valid_score"], "test_score": res["test_score"]}])
                     tune_df.to_csv(run_dir / "tuning" / f"{mname}_fold{fold_idx}.csv", index=False)
                 res["params"] = best_params
+                try:
+                    result_json.write_text(json.dumps(res, default=str))
+                except Exception:
+                    pass
                 print(f"[Step4] Done model: {mname} (fold {fold_idx}) best_valid={res['valid_score']:.6f}")
                 return res
 
@@ -1345,6 +1565,10 @@ def main() -> None:
                 id_test=id_test_idx,
             )
             res["params"] = best_params or {}
+            try:
+                result_json.write_text(json.dumps(res, default=str))
+            except Exception:
+                pass
             print(f"[Step4] Done model: {mname} (fold {fold_idx}) best_valid={res['valid_score']:.6f}")
             return res
 
@@ -1359,6 +1583,23 @@ def main() -> None:
                 ):
                     try:
                         res = fut.result()
+                        res.update(
+                            {
+                                "fold_id": split.get("fold_id", fold_idx),
+                                "train_start": split["train"][0],
+                                "train_end": split["train"][1],
+                                "val_start": split["valid"][0],
+                                "val_end": split["valid"][1],
+                                "test_start": split["test"][0],
+                                "test_end": split["test"][1],
+                                "feature_set": args.feature_set,
+                                "label_mode": args.label_mode,
+                                "split_mode": args.split_mode,
+                                "n_train": int(len(X_train)),
+                                "n_val": int(len(X_valid)),
+                                "n_test": int(len(X_test)),
+                            }
+                        )
                         metrics_rows.append(res)
                         best_params_by_model[res["model_name"]] = res.get("params", {})
                     except Exception as e:
@@ -1370,6 +1611,23 @@ def main() -> None:
                     continue
                 try:
                     res = _run_one(model_name)
+                    res.update(
+                        {
+                            "fold_id": split.get("fold_id", fold_idx),
+                            "train_start": split["train"][0],
+                            "train_end": split["train"][1],
+                            "val_start": split["valid"][0],
+                            "val_end": split["valid"][1],
+                            "test_start": split["test"][0],
+                            "test_end": split["test"][1],
+                            "feature_set": args.feature_set,
+                            "label_mode": args.label_mode,
+                            "split_mode": args.split_mode,
+                            "n_train": int(len(X_train)),
+                            "n_val": int(len(X_valid)),
+                            "n_test": int(len(X_test)),
+                        }
+                    )
                     metrics_rows.append(res)
                     best_params_by_model[res["model_name"]] = res.get("params", {})
                 except Exception as e:
@@ -1402,6 +1660,63 @@ def main() -> None:
 
     metrics_df = pd.DataFrame(metrics_rows)
     metrics_df.to_csv(run_dir / "metrics_raw.csv", index=False)
+    if args.split_mode == "forward" and not metrics_df.empty:
+        fcols = [
+            "fold_id",
+            "train_start",
+            "train_end",
+            "val_start",
+            "val_end",
+            "test_start",
+            "test_end",
+            "model_name",
+            "feature_set",
+            "label_mode",
+            "valid_score",
+            "test_score",
+            "n_train",
+            "n_val",
+            "n_test",
+        ]
+        forward_df = metrics_df[fcols].rename(
+            columns={"valid_score": "valid_daily_ic", "test_score": "test_daily_ic"}
+        )
+        save_table(forward_df, dirs["tables"] / "metrics_forward_folds.csv")
+        summary = (
+            forward_df.groupby(["model_name", "feature_set", "label_mode"], as_index=False)
+            .agg(
+                mean_valid_ic=("valid_daily_ic", "mean"),
+                mean_test_ic=("test_daily_ic", "mean"),
+                std_valid_ic=("valid_daily_ic", "std"),
+                std_test_ic=("test_daily_ic", "std"),
+            )
+        )
+        summary["IR_test"] = summary["mean_test_ic"] / (summary["std_test_ic"] + 1e-12)
+        save_table(summary, dirs["tables"] / "metrics_forward_summary.csv")
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(9, 5))
+            for m, g in forward_df.groupby("model_name"):
+                g = g.sort_values("fold_id")
+                ax.plot(g["fold_id"], g["test_daily_ic"], marker="o", label=m)
+            ax.set_xlabel("fold_id")
+            ax.set_ylabel("test_daily_ic")
+            ax.set_title("Forward Test IC by Fold")
+            ax.legend(loc="best", fontsize=8)
+            fig.savefig(dirs["figures"] / "forward_test_ic_by_fold.png", dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+            fig, ax = plt.subplots(figsize=(8, 4))
+            s2 = summary.sort_values("mean_test_ic", ascending=False)
+            ax.bar(s2["model_name"], s2["mean_test_ic"], yerr=s2["std_test_ic"].fillna(0).to_numpy())
+            ax.set_ylabel("mean_test_ic")
+            ax.set_title("Forward Summary (mean±std)")
+            ax.tick_params(axis="x", rotation=30)
+            fig.savefig(dirs["figures"] / "forward_summary_bar.png", dpi=180, bbox_inches="tight")
+            plt.close(fig)
+        except Exception:
+            pass
 
     if metrics_df.empty:
         return
@@ -1472,6 +1787,18 @@ def main() -> None:
         best_params["use_id_embedding"] = args.use_id_embedding
         best_params["id_emb_dim"] = args.id_emb_dim
         best_params["id_dropout_p"] = args.id_dropout_p
+        best_params.setdefault("optim", args.optim)
+        best_params.setdefault("lr", args.lr)
+        best_params.setdefault("weight_decay", args.weight_decay)
+        best_params.setdefault("grad_clip_norm", args.grad_clip_norm)
+        best_params.setdefault("best_metric", args.best_metric)
+        best_params.setdefault("early_stop_metric", args.early_stop_metric)
+        best_params.setdefault("early_stop_patience", args.early_stop_patience)
+        best_params.setdefault("early_stop_min_delta", args.early_stop_min_delta)
+        best_params.setdefault("scheduler_type", args.scheduler_type)
+        best_params.setdefault("plateau_factor", args.plateau_factor)
+        best_params.setdefault("plateau_patience", args.plateau_patience)
+        best_params.setdefault("plateau_min_lr", args.plateau_min_lr)
     elif best in {"torch_linear", "torch_mlp"}:
         best_params = dict(best_params)
         best_params["valid_dates"] = best_data["meta_valid"]["date"].to_numpy()
@@ -1480,6 +1807,18 @@ def main() -> None:
         best_params["use_id_embedding"] = args.use_id_embedding
         best_params["id_emb_dim"] = args.id_emb_dim
         best_params["id_dropout_p"] = args.id_dropout_p
+        best_params.setdefault("optim", args.optim)
+        best_params.setdefault("lr", args.lr)
+        best_params.setdefault("weight_decay", args.weight_decay)
+        best_params.setdefault("grad_clip_norm", args.grad_clip_norm)
+        best_params.setdefault("best_metric", args.best_metric)
+        best_params.setdefault("early_stop_metric", args.early_stop_metric)
+        best_params.setdefault("early_stop_patience", args.early_stop_patience)
+        best_params.setdefault("early_stop_min_delta", args.early_stop_min_delta)
+        best_params.setdefault("scheduler_type", args.scheduler_type)
+        best_params.setdefault("plateau_factor", args.plateau_factor)
+        best_params.setdefault("plateau_patience", args.plateau_patience)
+        best_params.setdefault("plateau_min_lr", args.plateau_min_lr)
     best_model, best_predict_fn = _train_model(
         best,
         Xtr_best,
@@ -1540,8 +1879,21 @@ def main() -> None:
     print("[Step6] Feature ablation start")
     seq_model = best in {"torch_cnn", "torch_rnn", "torch_lstm", "torch_gru"}
     seq_required = {f"r_{i}" for i in range(20)} | {f"dv_{i}" for i in range(20)}
-    variant_order = ["CORE", "CORE+ID", "CORE+MISSING", "CORE+ID+MISSING", "FULL", "FULL-ID", "-MISSING", "-IND", "-ECON", "-BETA"]
-    variant_cfg = build_ablation_variants()
+    if args.feature_set == "raw_only":
+        # raw_only already excludes engineered/extended feature families; skip drop/add-one ablation.
+        variant_order = ["RAW_ONLY_BASE"]
+        variant_cfg = {"RAW_ONLY_BASE": {"use_id": False, "use_missing": False}}
+    elif args.feature_set == "raw_plus_econ":
+        variant_order = ["BASE", "-IND", "-ECON", "-BETA"]
+        variant_cfg = {
+            "BASE": {"use_id": False, "use_missing": False},
+            "-IND": {"use_id": False, "use_missing": False},
+            "-ECON": {"use_id": False, "use_missing": False},
+            "-BETA": {"use_id": False, "use_missing": False},
+        }
+    else:
+        variant_order = ["CORE", "CORE+ID", "CORE+MISSING", "CORE+ID+MISSING", "FULL", "FULL-ID", "-MISSING", "-IND", "-ECON", "-BETA"]
+        variant_cfg = build_ablation_variants()
     ablation_rows = []
 
     for vname in variant_order:
@@ -1565,6 +1917,8 @@ def main() -> None:
             include_missing_features=use_missing_v,
             include_time_constant_features=args.include_time_constant_features,
             drop_redundant_features=args.drop_redundant_features,
+            feature_set=args.feature_set,
+            use_id_encoding=use_id_enc_v,
         )
         Xva_v, yva_v, wva_v = transform_eval(
             dfva_v,
@@ -1573,6 +1927,8 @@ def main() -> None:
             include_missing_features=use_missing_v,
             include_time_constant_features=args.include_time_constant_features,
             drop_redundant_features=args.drop_redundant_features,
+            feature_set=args.feature_set,
+            use_id_encoding=use_id_enc_v,
         )
         Xte_v, yte_v, wte_v = transform_eval(
             dfte_v,
@@ -1581,6 +1937,8 @@ def main() -> None:
             include_missing_features=use_missing_v,
             include_time_constant_features=args.include_time_constant_features,
             drop_redundant_features=args.drop_redundant_features,
+            feature_set=args.feature_set,
+            use_id_encoding=use_id_enc_v,
         )
 
         keep_cols = filter_variant_columns(list(feat_v), vname, include_missing_features=use_missing_v)
@@ -1649,8 +2007,14 @@ def main() -> None:
         (dirs["ablation"] / f"variant_{vname}_feature_cols.txt").write_text("\n".join(keep_cols) + "\n")
 
     add_df, drop_df = make_ablation_tables(ablation_rows)
-    save_table(add_df, dirs["ablation"] / "ablation_addone.csv")
-    save_table(drop_df, dirs["ablation"] / "ablation_dropone.csv")
+    if args.feature_set == "raw_only":
+        # Keep output files reproducible while clearly indicating ablation is intentionally skipped.
+        base_df = pd.DataFrame(ablation_rows)
+        save_table(base_df, dirs["ablation"] / "ablation_addone.csv")
+        save_table(base_df, dirs["ablation"] / "ablation_dropone.csv")
+    else:
+        save_table(add_df, dirs["ablation"] / "ablation_addone.csv")
+        save_table(drop_df, dirs["ablation"] / "ablation_dropone.csv")
     if not drop_df.empty:
         plot_ablation(
             drop_df.rename(columns={"variant_name": "setting", "valid_score": "valid_score"}),
@@ -1707,6 +2071,21 @@ def main() -> None:
         dirs["figures"] / "permutation_top30.png",
     )
     print("[Step7] Feature importance done")
+
+    print("[Step8] Torch history plots start")
+    torch_hist_dir = run_dir / "tuning" / "torch_loss"
+    torch_fig_dir = dirs["figures"] / "torch_history"
+    torch_fig_dir.mkdir(parents=True, exist_ok=True)
+    if torch_hist_dir.exists():
+        for csv_path in sorted(torch_hist_dir.glob("*.csv")):
+            try:
+                hist_df = pd.read_csv(csv_path)
+                out_png = torch_fig_dir / f"{csv_path.stem}.png"
+                plot_torch_training_history(hist_df, out_png, title=csv_path.stem)
+            except Exception as e:
+                if args.debug:
+                    print(f"[DEBUG] Skip torch history plot {csv_path.name}: {e}")
+    print("[Step8] Torch history plots done")
 
     # Optional SHAP
     try:

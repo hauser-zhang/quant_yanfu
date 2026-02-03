@@ -24,6 +24,19 @@ def _prepare_X(X):
     return X.fillna(0).to_numpy(dtype=np.float32)
 
 
+def _assert_finite_after_fill(X, name: str):
+    """Assert feature matrix has finite values after fillna(0)."""
+    arr = X.fillna(0).to_numpy(dtype=np.float32)
+    if np.isfinite(arr).all():
+        return arr
+    bad_cols = []
+    for c in X.columns:
+        v = X[c].fillna(0).to_numpy(dtype=np.float32)
+        if not np.isfinite(v).all():
+            bad_cols.append(c)
+    raise ValueError(f"Non-finite values found in {name} after fillna(0). offending_cols={bad_cols[:20]}")
+
+
 def _weighted_mse(pred, target, weight):
     """Weighted MSE with normalization by weight sum."""
     return (weight * (pred - target) ** 2).sum() / (weight.sum() + 1e-12)
@@ -73,8 +86,14 @@ class CNNBackbone(_try_import_torch().nn.Module):
         torch = _try_import_torch()
         self.blocks = torch.nn.ModuleList()
         self.residual = residual
+        # Accept int/tuple/list for channels from param grid.
+        if isinstance(channels, (int, np.integer)):
+            channels = [int(channels)]
+        elif not isinstance(channels, (list, tuple)):
+            channels = [int(channels)]
         prev = in_channels
         for ch in channels:
+            ch = int(ch)
             layers = [torch.nn.Conv1d(prev, ch, kernel_size=kernel_size, padding=kernel_size // 2)]
             if batch_norm:
                 layers.append(torch.nn.BatchNorm1d(ch))
@@ -263,6 +282,15 @@ def train_torch_model(
     grid_total = kwargs.get("grid_total", None)
     param_tag = kwargs.get("param_tag", None)
     scheduler_type = str(kwargs.get("scheduler_type", "plateau_ic"))
+    plateau_factor = float(kwargs.get("plateau_factor", 0.8))
+    plateau_patience = int(kwargs.get("plateau_patience", 8))
+    plateau_min_lr = float(kwargs.get("plateau_min_lr", 1e-5))
+    best_metric = str(kwargs.get("best_metric", "ic")).lower()
+    early_stop_metric = str(kwargs.get("early_stop_metric", "ic")).lower()
+    if best_metric not in {"ic", "loss"}:
+        raise ValueError("best_metric must be one of: ic, loss")
+    if early_stop_metric not in {"ic", "loss"}:
+        raise ValueError("early_stop_metric must be one of: ic, loss")
     valid_dates = kwargs.get("valid_dates", None)
     if valid_dates is not None:
         valid_dates = np.asarray(valid_dates)
@@ -273,8 +301,14 @@ def train_torch_model(
     id_valid = kwargs.get("id_valid", None)
     id_predict = kwargs.get("id_predict", None)
 
-    Xtr = _prepare_X(X_train)
-    Xva = _prepare_X(X_valid)
+    if hasattr(X_train, "columns"):
+        Xtr = _assert_finite_after_fill(X_train, "X_train")
+    else:
+        Xtr = _prepare_X(X_train)
+    if hasattr(X_valid, "columns"):
+        Xva = _assert_finite_after_fill(X_valid, "X_valid")
+    else:
+        Xva = _prepare_X(X_valid)
     ytr = y_train.astype(np.float32)
     yva = y_valid.astype(np.float32)
     wtr = w_train.astype(np.float32)
@@ -284,7 +318,12 @@ def train_torch_model(
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
-    lr = kwargs.get("lr", 1e-3)
+    lr = float(kwargs.get("lr", 3e-4))
+    weight_decay = float(kwargs.get("weight_decay", 1e-4))
+    grad_clip_norm = float(kwargs.get("grad_clip_norm", 1.0))
+    optim_name = str(kwargs.get("optim", "adamw")).lower()
+    if optim_name not in {"adamw", "adam"}:
+        raise ValueError("optim must be one of: adamw, adam")
     max_epochs = kwargs.get("max_epochs", max_epochs)
 
     if model_type in {"linear", "mlp"}:
@@ -349,19 +388,75 @@ def train_torch_model(
     else:
         id_embed = None
         params_all = list(model.parameters())
-    opt = torch.optim.Adam(params_all, lr=lr)
+    if optim_name == "adamw":
+        opt = torch.optim.AdamW(params_all, lr=lr, weight_decay=weight_decay)
+    else:
+        opt = torch.optim.Adam(params_all, lr=lr, weight_decay=weight_decay)
     scheduler = None
     if scheduler_type == "plateau_ic":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, mode="max", factor=0.8, patience=3, min_lr=1e-5
+            opt, mode="max", factor=plateau_factor, patience=plateau_patience, min_lr=plateau_min_lr
         )
     elif scheduler_type == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_epochs, eta_min=lr * 0.05)
-    best_loss = float("inf")
+    if best_metric == "ic":
+        best_score = float("-inf")
+    else:
+        best_score = float("inf")
+    if early_stop_metric == "ic":
+        early_best_score = float("-inf")
+    else:
+        early_best_score = float("inf")
     best_state = None
+    best_id_state = None
     best_epoch = -1
     patience_count = 0
     history = []
+    history_fields = [
+        "epoch",
+        "train_loss",
+        "train_corr",
+        "valid_loss",
+        "valid_corr",
+        "valid_ic",
+        "lr",
+        "weight_decay",
+        "grad_clip_norm",
+        "optim",
+        "best_epoch",
+        "best_metric_value",
+    ]
+
+    def _flush_history() -> None:
+        """Write history CSV and a quick trend plot so training progress is visible during run."""
+        if not log_path or not history:
+            return
+        path = Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=history_fields)
+            writer.writeheader()
+            writer.writerows(history)
+        # Best effort: plot should not break training.
+        try:
+            import matplotlib.pyplot as plt
+
+            dfh = pd.DataFrame(history).sort_values("epoch")
+            fig, axes = plt.subplots(2, 1, figsize=(9, 6), dpi=150, sharex=True)
+            axes[0].plot(dfh["epoch"], dfh["train_loss"], label="train_loss", linewidth=1.4)
+            axes[0].plot(dfh["epoch"], dfh["valid_loss"], label="valid_loss", linewidth=1.4)
+            axes[0].set_ylabel("Loss")
+            axes[0].legend(frameon=False)
+            axes[1].plot(dfh["epoch"], dfh["train_corr"], label="train_ic", linewidth=1.4)
+            axes[1].plot(dfh["epoch"], dfh["valid_ic"], label="valid_ic", linewidth=1.4)
+            axes[1].set_ylabel("IC")
+            axes[1].set_xlabel("Epoch")
+            axes[1].legend(frameon=False)
+            fig.tight_layout()
+            fig.savefig(path.with_suffix(".png"), bbox_inches="tight")
+            plt.close(fig)
+        except Exception:
+            pass
 
     n_train = Xtr.shape[0]
     n_valid = Xva.shape[0]
@@ -429,6 +524,8 @@ def train_torch_model(
             loss = _weighted_mse(pred, yb, wb)
             opt.zero_grad()
             loss.backward()
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(params_all, grad_clip_norm)
             opt.step()
             train_loss_sum += float(loss.item()) * len(xb)
             train_count += len(xb)
@@ -474,41 +571,48 @@ def train_torch_model(
             valid_corr = weighted_corr(yv_all, preds_v, wv_all)
             valid_ic = valid_corr
 
-        # compute weighted corr only when logging (can be expensive)
-        do_log = log_every > 0 and (epoch + 1) % log_every == 0
-        train_corr = float("nan")
+        # Print/flush cadence.
+        do_log = (
+            log_every <= 1
+            or (log_every > 0 and (epoch + 1) % log_every == 0)
+            or epoch == 0
+            or (epoch + 1) == int(max_epochs)
+        )
+        def _predict_all(loader):
+            preds = []
+            ys = []
+            ws = []
+            with torch.no_grad():
+                for batch in loader:
+                    if use_id_embedding and id_embed is not None:
+                        xb, yb, wb, ib = batch
+                    else:
+                        xb, yb, wb = batch
+                        ib = None
+                    xb = xb.to(dev)
+                    if ib is not None:
+                        ib = ib.to(dev)
+                        e = id_embed(ib)
+                        pv_t = model(xb, e) if model_type in {"cnn", "rnn", "lstm", "gru"} else model(torch.cat([xb, e], dim=1))
+                    else:
+                        pv_t = model(xb)
+                    pv = pv_t.view(-1).detach().cpu().numpy()
+                    preds.append(pv)
+                    ys.append(yb.view(-1).cpu().numpy())
+                    ws.append(wb.view(-1).cpu().numpy())
+            return np.concatenate(preds), np.concatenate(ys), np.concatenate(ws)
+
+        # Always compute train IC each epoch so history plots show full train curve.
+        preds_tr, ytr_all, wtr_all = _predict_all(train_loader)
+        train_corr = weighted_corr(ytr_all, preds_tr, wtr_all)
+
         if do_log:
-            def _predict_all(loader):
-                preds = []
-                ys = []
-                ws = []
-                with torch.no_grad():
-                    for batch in loader:
-                        if use_id_embedding and id_embed is not None:
-                            xb, yb, wb, ib = batch
-                        else:
-                            xb, yb, wb = batch
-                            ib = None
-                        xb = xb.to(dev)
-                        if ib is not None:
-                            ib = ib.to(dev)
-                            e = id_embed(ib)
-                            pv_t = model(xb, e) if model_type in {"cnn", "rnn", "lstm", "gru"} else model(torch.cat([xb, e], dim=1))
-                        else:
-                            pv_t = model(xb)
-                        pv = pv_t.view(-1).detach().cpu().numpy()
-                        preds.append(pv)
-                        ys.append(yb.view(-1).cpu().numpy())
-                        ws.append(wb.view(-1).cpu().numpy())
-                return np.concatenate(preds), np.concatenate(ys), np.concatenate(ws)
-
-            preds_tr, ytr_all, wtr_all = _predict_all(train_loader)
-            train_corr = weighted_corr(ytr_all, preds_tr, wtr_all)
-
             msg = (
                 f"[Epoch {epoch + 1}/{max_epochs}] "
                 f"train_loss={train_loss:.4f}, train_ic={train_corr:.4f}, "
-                f"val_loss={vloss:.4f}, val_ic={valid_corr:.4f}, lr={opt.param_groups[0]['lr']:.2e}"
+                f"valid_loss={vloss:.4f}, valid_ic={valid_corr:.4f}, "
+                f"best_epoch={best_epoch}, best_metric_value={(best_score if np.isfinite(best_score) else float('nan')):.6f}, "
+                f"lr={opt.param_groups[0]['lr']:.2e}"
             )
             print(msg)
             print("")
@@ -520,6 +624,17 @@ def train_torch_model(
             else:
                 scheduler.step()
 
+        best_value = valid_ic if best_metric == "ic" else vloss
+        if best_metric == "ic":
+            improved_best = np.isfinite(best_value) and (best_value > best_score + early_stop_min_delta)
+        else:
+            improved_best = np.isfinite(best_value) and (best_value < best_score - early_stop_min_delta)
+        if improved_best:
+            best_score = float(best_value)
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_id_state = {k: v.detach().clone() for k, v in id_embed.state_dict().items()} if id_embed is not None else None
+            best_epoch = epoch + 1
+
         history.append(
             {
                 "epoch": epoch + 1,
@@ -529,36 +644,32 @@ def train_torch_model(
                 "valid_corr": float(valid_corr),
                 "valid_ic": float(valid_ic),
                 "lr": float(opt.param_groups[0]["lr"]),
+                "weight_decay": float(weight_decay),
+                "grad_clip_norm": float(grad_clip_norm),
+                "optim": optim_name,
+                "best_epoch": int(best_epoch),
+                "best_metric_value": float(best_score) if np.isfinite(best_score) else np.nan,
             }
         )
-        if log_path and do_log:
-            path = Path(log_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("w", newline="") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=[
-                        "epoch",
-                        "train_loss",
-                        "train_corr",
-                        "valid_loss",
-                        "valid_corr",
-                        "valid_ic",
-                        "lr",
-                    ],
-                )
-                writer.writeheader()
-                writer.writerows(history)
-        if vloss < best_loss - early_stop_min_delta:
-            best_loss = vloss
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            best_epoch = epoch + 1
+        if do_log:
+            _flush_history()
+        early_value = valid_ic if early_stop_metric == "ic" else vloss
+        if early_stop_metric == "ic":
+            improved_early = np.isfinite(early_value) and (early_value > early_best_score + early_stop_min_delta)
+        else:
+            improved_early = np.isfinite(early_value) and (early_value < early_best_score - early_stop_min_delta)
+        if improved_early:
+            early_best_score = float(early_value)
             patience_count = 0
         else:
             if early_stop_patience > 0:
                 patience_count += 1
                 if patience_count >= early_stop_patience:
-                    msg = f"Early stop at epoch {epoch + 1} (best={best_epoch}, best_loss={best_loss:.4f})"
+                    msg = (
+                        f"Early stop at epoch {epoch + 1} by {early_stop_metric} "
+                        f"(best_epoch={best_epoch}, best_metric={best_metric}, best_value={best_score:.6f}, "
+                        f"curr_valid_ic={valid_ic:.6f}, curr_valid_loss={vloss:.6f})"
+                    )
                     if show_progress:
                         tqdm.write(msg)
                     else:
@@ -567,17 +678,12 @@ def train_torch_model(
 
     if best_state is not None:
         model.load_state_dict(best_state)
+    if id_embed is not None and best_id_state is not None:
+        id_embed.load_state_dict(best_id_state)
 
-    if log_path:
-        path = Path(log_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", newline="") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["epoch", "train_loss", "train_corr", "valid_loss", "valid_corr", "valid_ic", "lr"],
-            )
-            writer.writeheader()
-            writer.writerows(history)
+    print(f"Best epoch by {best_metric}: {best_epoch}, best_value={best_score:.6f}")
+
+    _flush_history()
 
     def predict_fn(Xnew, id_new=None):
         model.eval()

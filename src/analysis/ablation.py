@@ -21,11 +21,13 @@ def filter_variant_columns(
     beta_cols = {"beta", "indbeta"}
     econ_prefixes = ("mom_", "rev_", "vol_", "absret_", "dv_log_", "dv_shock", "pv_corr", "ret_")
 
-    if variant_name in {"FULL", "CORE"}:
+    if variant_name in {"FULL", "CORE", "BASE", "RAW_ONLY_BASE"}:
         return cols
-    if variant_name in {"-MISSING", "CORE+ID", "CORE+ID+MISSING", "FULL-ID"}:
-        if variant_name in {"-MISSING", "FULL-ID"}:
-            return [c for c in cols if c not in miss_cols]
+    if variant_name == "-MISSING":
+        return [c for c in cols if c not in miss_cols]
+    if variant_name in {"CORE+ID", "CORE+ID+MISSING", "FULL-ID", "CORE+MISSING"}:
+        # ID toggles do not change explicit feature columns (id embedding/encoding is handled outside).
+        return cols
     if variant_name in {"-IND"}:
         return [c for c in cols if not c.startswith("industry_") and not c.startswith("ind_")]
     if variant_name in {"-ECON"}:
@@ -61,6 +63,21 @@ def make_ablation_tables(rows: List[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pd.DataFrame(rows)
     if df.empty:
         return df, df
+    if "RAW_ONLY_BASE" in set(df["variant_name"]):
+        out = df.copy()
+        out["delta_valid"] = 0.0
+        out["delta_test"] = 0.0
+        return out, out
+    if "BASE" in set(df["variant_name"]):
+        drop_df = df.copy()
+        base_valid = drop_df.loc[drop_df["variant_name"] == "BASE", "valid_score"]
+        base_test = drop_df.loc[drop_df["variant_name"] == "BASE", "test_score"]
+        b_v = float(base_valid.iloc[0]) if not base_valid.empty else float("nan")
+        b_t = float(base_test.iloc[0]) if not base_test.empty else float("nan")
+        drop_df["delta_valid"] = drop_df["valid_score"] - b_v
+        drop_df["delta_test"] = drop_df["test_score"] - b_t
+        return pd.DataFrame(columns=drop_df.columns), drop_df
+
     add_names = {"CORE", "CORE+ID", "CORE+MISSING", "CORE+ID+MISSING"}
     drop_names = {"FULL", "FULL-ID", "-MISSING", "-IND", "-ECON", "-BETA"}
 
@@ -81,4 +98,3 @@ def make_ablation_tables(rows: List[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
     drop_df["delta_valid"] = drop_df["valid_score"] - f_v
     drop_df["delta_test"] = drop_df["test_score"] - f_t
     return add_df, drop_df
-

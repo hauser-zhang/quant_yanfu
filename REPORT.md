@@ -1,7 +1,6 @@
 # 量化项目研究报告
 
 > 目标：使用每只股票当日的日内收益/成交金额序列特征（r_0~r_19, dv_0~dv_19）及慢变基本面特征（f_0~f_9）等，预测未来 1 天个股收益，并以 **daily-weighted-mean IC** 作为唯一评估标准构建与迭代模型。  
-> 注：本文严格区分“已实现/已跑结果”与“计划但未实现”部分（如 Transformer）。
 
 ---
 
@@ -83,7 +82,7 @@
 
 我们因此在工程上采用两阶段策略：
 - **统计筛除**：对全样本统计每个 `r_i/dv_i` 的缺失率与“按日整列缺失频率”，若某列长期无效（如缺失率 > 95%），直接从特征中移除，结果如下图所示：  
-![](res/experiments/DL_5__simple__winsor_csz__xw1_xz1__dv1_tf1_mkt1_ind1__q0.02-0.98_n50__sd0/figures/missingness_top30.png)
+![](res/experiments/timeForward_raw2__forward__rolling__winsor_csz__raw_only__xw1_xz1_zf0__dv1_tf1_mkt1_ind1__q0.01-0.99_n50__sd0/figures/missingness_top30.png)
 大部分输入特征缺失率均较小（<1%）。
 - **缺失显式建模**：不移除特征列，对存在缺失的列，采用 `fillna(0)` + 缺失指示/缺失计数特征（可开关）让模型区分“真实 0”与“缺失填 0”。  
 
@@ -114,14 +113,9 @@
 - 再按日权重 `W_t = sum_i w_{t,i}` 做跨日加权平均  
 - 同时报告 `IC_std` 与 `IC_IR = mean/std` 作为稳定性度量
 
-输出文件：
-- `res/experiments/{RUN_NAME}/factor_ic/factor_ic_table.csv`  
-- `res/experiments/{RUN_NAME}/factor_ic/factor_ic_top20.png`  
-（如启用更多图：`factor_ic_hist.png`）
+IC相关性较高的20个特征如下：
+![](res/experiments/timeForward_all__forward__rolling__winsor_csz__all_extended__xw1_xz1_zf0__dv1_tf1_mkt1_ind1__q0.01-0.99_n50__sd0/factor_ic/factor_ic_top20.png)
 
-解释原则：
-- 单因子 IC 仅衡量“线性边际预测能力”；多因子/非线性模型可能利用交互与非线性获得额外收益。  
-- industry/beta 等“暴露类特征”即使 IC 较高，也不必然代表可交易 alpha，需要在中性化/消融实验中进一步验证。
 
 ---
 
@@ -140,9 +134,8 @@
 对每个日期横截面，按分位截断极端值（如 1%/99%），减少异常点影响。
 
 3) **按日标准化（x_zscore_by_date）**  
-对每个日期横截面，将连续特征做 z-score，将所有特征标准化、scale对齐。  
-动机：消除跨日尺度差异，使模型更聚焦当日横截面相对差异（与 IC 目标对齐），同时使得各个特征的scale接近，避免某些特征值太大导致其他特征被掩盖。
-
+默认对 `r_*`、`dv_*`、`ind_*`、`beta/indbeta` 等做按日 z-score；`f_*` 默认不做按日 z-score（可开关 `--zscore_f_features`）。  
+动机：`f_*` 已预归一且慢变，重复按日标准化可能破坏跨日可比性；`ind_*` 在日内横截面存在差异，因此纳入按日标准化。
 
 ---
 
@@ -155,11 +148,11 @@
    - 按日做横截面 z-score：`y_csz = (y - mean_t) / std_t`  
    意义：强调当日相对收益排序，弱化跨日波动差异。
 
-2) **neu_winsor_csz（标签中性化）**  
+2) **neu_winsor_csz（标签中性化，可选）**  
 在 `winsor_csz` 前或后，对行业与风险暴露做回归：
    - `y ~  beta*all + indbeta*industry + residual_alpha`  
    取残差作为标签，再做按日标准化（或相反顺序需明确并固定）。  
-   意义：剥离系统性暴露，使目标更接近 residual alpha，提升可解释性。
+   - 意义：中性化（neutralization）作为可选的数据处理步骤，用于在“信号含义”层面区分系统性暴露与个股特异超额收益（residual alpha）。在横截面预测中，行业与 `beta/indbeta` 等风险暴露往往能带来较高相关，但其经济学含义更接近系统性风险溢价或行业轮动暴露，未必代表可控的 alpha；因此我们通过按日横截面回归将这些共同成分剥离，使模型更聚焦于个股特异部分。
 
 ---
 
@@ -226,74 +219,51 @@
 
 ---
 
-## 3. 初步模型构建（机器学习模型）
+## 3. 模型架构和训练过程
 
 ### 3.1 统一训练设置
 
-- 数据切分：支持 simple split 与 forward split（第 6 章对比）   
+
+- 数据切分：本研究采用滚动/扩窗训练（time-forward-rolling），验证与测试窗口随时间前进，模拟真实上线迭代，以保证验证的稳定性。具体而言，设置`FORWARD_TRAIN_MONTHS = 12, FORWARD_VAL_MONTHS = FORWARD_TEST_MONTHS = 3, FORWARD_STEP_MONTHS = 6`。即每次使用12个月数据训练，随后3个月数据作验证集，3个月数据作测试集。以步长6个月后移，直到数据终点，所有轮次中，使用训练数据进行模型训练，验证集合进行超参数调优，最终在独立测试集上进行模型性能评估，取所有轮次平均得分作为模型最终性能评估。
 - 唯一指标：**daily-weighted-mean IC**（按日加权相关，再跨日加权平均）
 
 - 输出位置：`res/experiments/{RUN_NAME}/metrics/metrics.csv`
 
 ---
 
-### 3.2 Baselines（tabular ML）
+### 3.2 机器学习模型
 
-已实现对比模型：
-- Ridge / ElasticNet（线性，强正则）
-- RandomForest / ExtraTrees（非线性树集成）
-- LightGBM（梯度提升树）
-- 简单MLP模型（基于Torch实现）
+本研究构建的机器学习模型如下：
+- ElasticNet（线性，强正则）
+- ExtraTrees（非线性树集成）
+- LightGBM / XG-boost（梯度提升树）
 
-不同模型性能比较如下：
-- LGBM valid 约 0.058（daily mean 口径），test 约 0.017  
-- ElasticNet test 约 0.058（daily mean 口径）  
-提示：不同口径/不同 split 下可能差异显著，需以“唯一指标 daily-weighted-mean IC + 统一 split”重新跑并确认结论。
+所有机器学习模型训练时，以所有输入特征作为输入（industry这类分类变量采取one-hot编码形式）。
 
 ---
 
-### 3.3 误差来源与下一步改进（ML 部分）
+### 3.3 深度学习模型
 
-- 尺度与重尾：dv 需 log1p + 按日标准化  
-- 缺失与整列缺失：长期无效列应删除；剩余缺失需 missing 特征辅助  
-- 过拟合：树模型可用更强正则（min_data_in_leaf、subsample、feature_fraction）；线性模型关注标准化与稳健标签  
-- regime shift：必须用 forward split 检验稳定性（第 6 章）
+深度学习模型采用 **Sequence + Tabular Hybrid** 架构，将日内序列与慢变特征分支建模，并显式拆分 alpha 与 risk：
 
----
+- **序列模块（sequence backbone）**：从 `(r_i, dv_i)` 的长度为 20 的短序列中提取局部模式（近端动量、反转、成交额冲击等）。该模块使用 **MLP / 1D-CNN(含 dilated conv/TCN) / RNN / LSTM / GRU** 等架构。
+- **基本面模块（fundamentals MLP）**：对 `f_*` 基本面特征做 MLP 表征后与序列 embedding 拼接，用于增强慢变信息。
+- **聚合金融特征模块（可选）**：对在原始 r/dv 基础上构建多窗口聚合特征特征做 MLP 表征后与上述特征拼接。
+- **风险模块（risk head）**：以 `industry` one-hot 与 `beta/indbeta` 为输入的线性头，建模市场/行业暴露项；最终预测为 `pred = alpha + risk`，提升可解释性并减轻 alpha 分支拟合压力。
+- **ID 模块（可选）**：当开启 `use_id_embedding` 时，对 `id` 使用 embedding（配合 embedding dropout）引入个体固定效应信息；该信息源易过拟合，因此必须在 forward rolling 下通过消融与对照实验验证其泛化收益。
 
-## 4. 深度学习方法
-
-### 4.1 MLP
-
-作为深度学习最简单基线，其性能能够
+模型使用MSE-loss和AdamW优化器进行训练，添加BatchNorm、DropOut以及Early-Stopping等以缓解过拟合问题。
 
 ---
 
-### 4.2 1D-CNN / TCN（已实现部分 / 或进行中）
+### 3.4 模型性能评估
 
-- CNN 用于从 (r_i, dv_i) 的短序列中提取局部模式（如近端动量、交易额冲击）。  
-- TCN（dilated conv）在短序列上常比 RNN 稳定，并具备更大感受野，适合作为 CNN 的升级路线。
-
-关键工程注意：
-- 序列顺序必须统一为 **old→new（r_19..r_0, dv_19..dv_0）**，保证“最后时刻=最新信息”。  
-- dv 建议在进入模型前已 log1p 并标准化，避免梯度被 dv 量纲主导。
-
----
-
-### 4.3 RNN/LSTM/GRU（已实现部分 / 或进行中）
-
-RNN 系列适合学习序列依赖，但更容易过拟合与训练不稳。建议：
-- 小 hidden（32 起步）、强正则（AdamW + weight_decay + grad clip）  
-- early stop 与 best checkpoint 以 valid daily IC 为准（训练 loss 不变）
-
----
-
-### 4.4 Transformer（未实现，计划）
-
-Transformer 适用于更长序列与跨日建模（例如把过去 N 天的特征序列作为输入）。  
-当前项目的日内序列只有 20 个时间步，Transformer 不一定优于 CNN/TCN；更合理的应用场景是“跨日序列”（需要额外特征构建与数据对齐）。
-
-【计划】后续若实现，将在同一指标与 split 下与 CNN/TCN 做严格对比，并配套消融实验。
+不同模型性能比较如下图所示：
+![](res/experiments/DL__simple__winsor_csz__xw1_xz1__dv1_tf1_mkt1_ind1__q0.02-0.98_n50__sd0/plots/model_comparison.png)
+- 总体而言，使用MLP为backbone的深度学习模型模型性能最优，在测试集上具有最高的平均IC（0.11），并且具有较低的跨轮次波动。
+- 各个模型都存在比较严重的过拟合现象（如下图所示），模型性能总体较差，由于时间原因和机器计算能力有限暂时还未很好解决。
+![](res/experiments/timeForward_all__forward__rolling__winsor_csz__all_extended__xw1_xz1_zf0__dv1_tf1_mkt1_ind1__q0.01-0.99_n50__sd0/tuning/torch_loss/torch_lstm_fold0_alpha_hidden_dim-128_alpha_layers-2_batch_size-128_best_metric-ic_dropout-0.2_ea_9b0d0e93.png)
+- 由于所有模型架构均存在过拟合问题，推断原因为金融特征信息中存在较大波动和噪音，模型难以从数据中学习到可泛化的特征模式，后续可能需要考虑对原始数据进行去噪和进一步细致清洗，排除其中低质量的训练数据。
 
 ---
 
@@ -301,118 +271,38 @@ Transformer 适用于更长序列与跨日建模（例如把过去 N 天的特�
 
 ### 5.1 重要性方法
 
-- 对树模型（LGBM）：使用 gain importance（分裂增益）  
-- 通用方法：permutation importance（在验证集打乱某列观察 IC 下降）
-
-输出位置：
-- `res/experiments/{RUN_NAME}/importance/gain_importance.csv`
-- `res/experiments/{RUN_NAME}/importance/permutation_importance.csv`
+- **树模型（LightGBM / ExtraTrees）**：使用 *gain importance* 作为快速筛查，并辅以 *permutation importance*（在验证集对单列置乱，观察 valid daily IC 的下降）作为与最终指标更一致的边际贡献度量。  
+- **深度模型（MLP/CNN/RNN）**：以 *permutation importance* 为主（输入列或特征组置乱），强调“破坏该信息源后，排序能力下降多少”。
 
 ---
 
-### 5.2 消融实验设计（核心：Drop-one + Add-one）
+### 5.2 消融实验结果
 
-为避免“默认关闭导致 drop 无意义”的问题，我们采用两条主线：
+对于训练得到的最优的模型架构，本研究随后采用消融实验方式来解析特征重要性以检验各个特征的平均收益与稳定性，发现其中对于股票收益预测具有重要意义的经济学特征（基本面特征/动量类/反转类/流动性冲击/行业状态等），从而能够有助于构建更好的投资策略。总体而言，我发现：
+- 对训练目标y按日期进行归一化和中性化对模型性能有小幅提升。
+- 添加动量、波动等聚合经济学特征对于模型性能有小幅提升。
+- 添加个股id特征对模型性能有小幅提升，但在某些场景下会加剧过拟合问题。
 
-A) Core baseline（默认关闭 ID/MISSING）  
-- `CORE`  
-- `CORE + ID`  
-- `CORE + MISSING`  
-- `CORE + (ID+MISSING)`（可选）
-
-B) Extended FULL（显式开启 ID/MISSING 等增强项）  
-- `FULL`  
-- `FULL - ID`  
-- `FULL - MISSING`  
-- `FULL - IND`（去 industry onehot + ind_*）  
-- `FULL - ECON`（去动量/反转/波动/流动性冲击等工程特征）  
-- `FULL - BETA`
-
-输出文件：
-- `res/experiments/{RUN_NAME}/ablation/ablation_addone.csv`
-- `res/experiments/{RUN_NAME}/ablation/ablation_dropone.csv`
-
-解释原则：
-- Add-one 衡量“引入价值”；Drop-one 衡量“边际贡献”；二者结合才可避免实验设计偏差。
+> TODO：消融实验的代码已完成，但由于模型过拟合问题尚未解决，该部分结果暂时还比较初步，我后续会继续完善调整模型后把这部分构建完成。
 
 ---
 
-### 5.3 Top 特征经济学解释（基于 best model 的实际结果）
+### 6.1 当前阶段最稳健方案
 
-【待填】从 importance 输出中选取 top 特征，逐一解释：
-- 动量类：信息扩散与趋势延续  
-- 反转类：微观结构噪声与流动性提供  
-- 流动性冲击：资金冲击/事件驱动  
-- 行业状态：行业轮动与资金偏好  
-并在消融结果中核对这些解释是否一致（例如去掉 ECON 后 IC 显著下降，说明工程特征确实贡献）。
+在本研究的统一评估口径（**daily-weighted-mean IC**）与 **time-forward rolling** 主评估框架下，我们将“稳健性”定义为：在多个前推轮次中取得**更高的平均测试 IC、较低的跨轮次波动（std）、以及更可解释的信号来源**。
 
----
+当前阶段最稳健的方案为使用原本输入特征+构建的聚合经济学特征，并对输入特征做归一化、预测目标y做归一化和中性化后，使用MLP作为基座的深度学习模型进行预测。
 
-## 6. 不同数据集划分方式的影响（在确定最优架构后进行）
+### 6.2 思路总结
 
-### 6.1 切分方式定义
+- 本研究首先通过 **单因子 IC sanity check** 验证信号存在性、识别长期缺失或信息含量不足的特征列，并将其作为后续特征工程与数据清洗的依据，从而避免在噪声维度上浪费模型容量。  
+- 在横截面次日收益预测中，**经济学工程特征**（多窗口动量/反转、波动、交易额冲击等）与 **行业状态信息（ind_*）** 往往构成主要的可解释增益来源：前者刻画短期价格与成交结构，后者反映行业层面的共同因子与轮动环境。  
+- **ID 与 Missing 信息**属于高风险增强项：它们可能提升拟合能力，但同样更容易引入“个体记忆”或“数据质量代理”导致的过拟合。
+- 所有的额外特征信息，都需要通过消融实验分析以检验其平均收益与稳定性，只有在跨轮次一致增益的情况下才应作为默认配置启用。 
+- 对于金融数据的显著非平稳性（regime shift），单次年份切分可能产生误导；采用 **forward rolling** 能更接近真实上线迭代过程，并提供对模型泛化能力更稳健的衡量标准。
+- 本研究构建了特异性的深度神经网络架构，对于不同数据类型的特征采用异构神经网络模块进行特征提取，并聚合各类特征信息进行最终预测。
 
-- simple split：例如 2016-2018 train，2019 valid，2020 test  
-- forward split：滚动/扩窗训练，验证与测试窗口随时间前进，模拟真实上线迭代
-
-### 6.2 为什么 forward 更能反映 regime shift
-
-金融市场存在显著的结构变化（波动水平、行业轮动、宏观政策、流动性环境）。  
-simple split 可能偶然对某段 regime 拟合较好，但 forward split 更接近真实交易系统的“在线更新”情景，因此更能检验模型的稳健性与泛化能力。
-
-### 6.3 对比实验（以当前最优架构为基准）
-
-【待填】选定一个当前最稳的模型架构（例如 LGBM 或 CNN/TCN），在两种 split 下对比 valid/test daily IC，并讨论差异来源。
-
----
-
-## 7. 中性化 / 缺失值处理等
-
-### 7.1 中性化的意义：从暴露到 residual alpha
-
-行业与 beta 暴露可能带来较高 IC，但其本质可能是“系统性风险溢价”而非可控 alpha。  
-通过中性化可以剥离这些暴露成分，使预测更聚焦于个股特异部分，从而提升可解释性，并减少对行业轮动的依赖。
-
-### 7.2 标签中性化 vs 预测中性化
-
-- 标签中性化（`neu_winsor_csz`）：在训练目标层面剥离暴露，模型直接学 residual alpha。  
-- 预测中性化（`pred_neutralize_by_date`）：模型先预测，再对 pred 做横截面回归残差作为最终信号。
-
-两者可对照实验以回答：
-- 哪种方式在 forward split 下更稳？  
-- 中性化是否牺牲了一部分可预测的系统性成分，从而影响 IC？
-
-### 7.3 缺失处理策略
-
-当前策略：
-- 数值特征进入模型前 `fillna(0)`（保证线性/NN 可训练）  
-- 可选地输入 missing features（cnt/isna）来区分“缺失填 0”与“真实 0”  
-- 对长期整列缺失的 r/dv 桶，优先统计后删除，避免噪声维度
-
-【下一步】对序列模型可加入 mask 通道（r_isna/dv_isna）以显式建模缺失位置。
-
-### 7.4 为什么剔除 daily-constant 时间特征（dow_/mkt_）
-
-在以 daily IC 为唯一指标的设定下，任何“同一天对所有股票相同”的特征，只会给预测加上当日常数项，而相关系数对加常数不敏感，因此对分数贡献几乎为零。  
-剔除此类特征能减少模型容量浪费与过拟合风险，并使报告更聚焦于可区分个股的信号来源（经济学特征、行业状态、缺失模式、个股固定效应等）。
-
----
-
-## 8. 总结
-
-### 8.1 当前阶段最稳健方案（待最终确认）
-
-【待填】基于统一口径与 forward split 的实验，给出当前最稳的模型与配置（例如 LGBM 或 CNN/TCN），并说明其关键特征来源贡献（来自消融实验）。
-
-### 8.2 关键结论
-
-- 单因子 IC sanity check 用于确认信号存在性与识别无效/缺失特征列  
-- 经济学工程特征（动量/流动性冲击等）与行业状态特征（ind_*）通常是提升横截面预测的核心来源  
-- ID 与 Missing 信息属于增强项，必须通过 Add-one/Drop-one 与 forward split 严格验证其可泛化性
-
-### 8.3 下一步改进方向
-
-- 更严格的长期缺失列筛除与 mask 建模  
-- 深度模型正则与架构升级：CNN → TCN →（跨日序列后）Transformer  
-- 更丰富的跨日滞后特征（lag features）用于提高次日可预测性  
-- 在 forward split 下做超参搜索与稳健性评估（不同市场状态/行业分组）
+### 6.3 下一步改进方向
+ 
+- **解决模型过拟合问题**：主要还是从数据清洗和去噪方面进行改进。首先考虑丢弃某些存在较大特征缺失比例的个股、日期的数据，但由于统计分析结果显示数据缺失比例不足1%，这块能够获得的提高估计有限；其次由于dv、r等时序数据时间点较少、粒度较粗，可能存在较大波动，考虑低通滤波等方式对信号进行平滑降噪处理。  
+- **跨日滞后信息扩展**：引入更丰富的 lag features（例如过去 N 日的聚合动量/波动/成交冲击），以缓解“仅用当日信息预测次日”的信号衰减问题，并与序列模块形成互补。

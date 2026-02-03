@@ -17,6 +17,7 @@ def _winsorize_group(args):
             continue
         x = res[col].astype(float)
         x_non = x.dropna()
+        # Winsorization can be skipped for small-N dates.
         if len(x_non) < min_n:
             continue
         lo = x_non.quantile(q_low)
@@ -31,7 +32,9 @@ def _zscore_group(args):
     for col in cols:
         x = res[col]
         x_non = x.dropna()
+        # For small-N dates we do NOT keep raw scale; force zero to avoid scale leakage.
         if len(x_non) < min_n:
+            res[col] = 0.0
             continue
         mu = x_non.mean()
         std = x_non.std()
@@ -131,6 +134,53 @@ def _get_feature_cols(
         and c not in exclude_time_constant
         and c not in exclude_redundant
     ]
+
+
+def filter_feature_cols_by_feature_set(
+    feature_cols: List[str],
+    df_columns: List[str],
+    feature_set: str = "raw_only",
+    include_missing_features: bool = False,
+    use_id_encoding: bool = False,
+) -> List[str]:
+    """Filter feature columns by configured feature scope."""
+    if feature_set not in {"raw_only", "raw_plus_econ", "all_extended"}:
+        raise ValueError("feature_set must be one of: raw_only, raw_plus_econ, all_extended")
+
+    cols = [c for c in feature_cols if c in set(df_columns)]
+    # Always remove daily-constant proxies for daily IC training.
+    cols = [c for c in cols if not c.startswith(("dow_", "mon_", "mkt_"))]
+
+    missing_cols = {"r_missing_cnt", "dv_missing_cnt", "beta_isna", "indbeta_isna", "any_f_missing", "industry_isna"}
+    econ_prefixes = ("mom_", "rev_", "vol_", "absret_", "dv_log_", "ret_")
+
+    def _is_raw(c: str) -> bool:
+        return (
+            c.startswith("r_")
+            or c.startswith("dv_")
+            or c.startswith("f_")
+            or c in {"beta", "indbeta", "industry"}
+            or c.startswith("industry_")
+        )
+
+    def _is_econ(c: str) -> bool:
+        return c == "dv_shock" or c == "pv_corr" or c.startswith(econ_prefixes)
+
+    if feature_set == "raw_only":
+        out = [c for c in cols if _is_raw(c)]
+    elif feature_set == "raw_plus_econ":
+        out = [c for c in cols if _is_raw(c) or _is_econ(c)]
+    else:
+        out = list(cols)
+        if not include_missing_features:
+            out = [c for c in out if c not in missing_cols]
+        if not use_id_encoding:
+            out = [c for c in out if c != "id_te"]
+    # For non-extended sets, force-drop ind/missing/id features.
+    if feature_set != "all_extended":
+        out = [c for c in out if not c.startswith("ind_")]
+        out = [c for c in out if c not in missing_cols and c != "id_te"]
+    return out
 
 
 def _encode_industry(df: pd.DataFrame, industry_cols: List[str] | None = None) -> Tuple[pd.DataFrame, List[str]]:
@@ -387,6 +437,8 @@ def fit_transform_train(
     include_missing_features: bool = False,
     include_time_constant_features: bool = False,
     drop_redundant_features: bool = True,
+    feature_set: str = "raw_only",
+    use_id_encoding: bool = False,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[str], EncoderState]:
     """Fit encoders on train set and return X/y/w."""
     df = df_train.copy()
@@ -399,6 +451,13 @@ def fit_transform_train(
         include_missing_features=include_missing_features,
         include_time_constant_features=include_time_constant_features,
         drop_redundant_features=drop_redundant_features,
+    )
+    feature_cols = filter_feature_cols_by_feature_set(
+        feature_cols,
+        list(df.columns),
+        feature_set=feature_set,
+        include_missing_features=include_missing_features,
+        use_id_encoding=use_id_encoding,
     )
     df_feat = df[feature_cols + [label_col, "weight"]].copy()
 
@@ -420,6 +479,8 @@ def transform_eval(
     include_missing_features: bool = False,
     include_time_constant_features: bool = False,
     drop_redundant_features: bool = True,
+    feature_set: str = "raw_only",
+    use_id_encoding: bool = False,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """Transform eval set using saved encoder state."""
     df = df_eval.copy()
@@ -432,6 +493,13 @@ def transform_eval(
         include_missing_features=include_missing_features,
         include_time_constant_features=include_time_constant_features,
         drop_redundant_features=drop_redundant_features,
+    )
+    feature_cols = filter_feature_cols_by_feature_set(
+        feature_cols,
+        list(df.columns),
+        feature_set=feature_set,
+        include_missing_features=include_missing_features,
+        use_id_encoding=use_id_encoding,
     )
     df_feat = df[feature_cols + [label_col, "weight"]].copy()
     df_feat, _ = _encode_industry(df_feat, industry_cols=state.industry_cols)
